@@ -1569,6 +1569,29 @@ def api_disciplina_completa():
         
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
+
+        # Normalizar datas
+        if 'entry_date' in df_consolidado.columns:
+            df_consolidado['entry_date'] = pd.to_datetime(df_consolidado['entry_date'], errors='coerce')
+        if 'exit_date' in df_consolidado.columns:
+            df_consolidado['exit_date'] = pd.to_datetime(df_consolidado['exit_date'], errors='coerce')
+
+        # Aplicar filtros opcionais
+        df_filtrado = df_consolidado
+        try:
+            if filter_date and 'entry_date' in df_filtrado.columns:
+                _dia = pd.to_datetime(filter_date, errors='coerce').date()
+                df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.date == _dia]
+            if filter_weekday and 'entry_date' in df_filtrado.columns:
+                if str(filter_weekday).isdigit():
+                    _idx = int(filter_weekday)
+                    df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.weekday == _idx]
+                else:
+                    df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.day_name() == filter_weekday]
+            if filter_month and 'entry_date' in df_filtrado.columns:
+                df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.to_period('M').astype(str) == filter_month]
+        except Exception:
+            pass
         
         # Calcular disciplina no DataFrame consolidado
         resultado = calcular_disciplina_completa(df_consolidado, fator_disciplina, multiplicador_furia)
@@ -2142,6 +2165,11 @@ def api_trades():
         # Obter parâmetros opcionais
         taxa_corretagem = float(request.form.get('taxa_corretagem', 0.5))
         taxa_emolumentos = float(request.form.get('taxa_emolumentos', 0.03))
+        # Filtros opcionais e granularidade
+        filter_date = request.form.get('filter_date')  # YYYY-MM-DD
+        filter_weekday = request.form.get('filter_weekday')  # Monday..Sunday ou 0-6
+        filter_month = request.form.get('filter_month')  # YYYY-MM
+        granularity = request.form.get('granularity')  # weekly|monthly|yearly
         
         # Lista para armazenar todos os DataFrames
         dataframes = []
@@ -2197,17 +2225,66 @@ def api_trades():
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
         
-        # Processar dados consolidados com mapeamento de arquivos
-        trades = processar_trades(df_consolidado, arquivo_para_indices)
-        estatisticas_gerais = calcular_estatisticas_gerais(df_consolidado)
-        estatisticas_por_ativo = calcular_estatisticas_por_ativo(df_consolidado)
-        estatisticas_temporais = calcular_estatisticas_temporais(df_consolidado)
-        custos = calcular_custos_operacionais(df_consolidado, taxa_corretagem, taxa_emolumentos)
+        # Processar dados filtrados com mapeamento de arquivos
+        trades = processar_trades(df_filtrado, arquivo_para_indices)
+        estatisticas_gerais = calcular_estatisticas_gerais(df_filtrado)
+        estatisticas_por_ativo = calcular_estatisticas_por_ativo(df_filtrado)
+        estatisticas_temporais = calcular_estatisticas_temporais(df_filtrado)
+        custos = calcular_custos_operacionais(df_filtrado, taxa_corretagem, taxa_emolumentos)
+
+        # Gráfico de pizza buy vs sell (long vs short)
+        pie_buy_sell = {}
+        if not df_filtrado.empty:
+            if 'direction' in df_filtrado.columns:
+                _dir = df_filtrado['direction'].fillna('long').astype(str).str.lower()
+                _tmp = df_filtrado.assign(_dir=_dir)
+                _counts = _tmp.groupby('_dir').size()
+                _sums = _tmp.groupby('_dir')['pnl'].sum() if 'pnl' in _tmp.columns else None
+                pie_buy_sell = {
+                    'buy_long': {
+                        'count': int(_counts.get('long', 0)),
+                        'pnl': float(round((_sums.get('long') if (_sums is not None and 'long' in _sums) else 0.0), 2))
+                    },
+                    'sell_short': {
+                        'count': int(_counts.get('short', 0)),
+                        'pnl': float(round((_sums.get('short') if (_sums is not None and 'short' in _sums) else 0.0), 2))
+                    }
+                }
+            else:
+                _pnl_series = pd.to_numeric(df_filtrado.get('pnl', pd.Series(dtype=float)), errors='coerce') if 'pnl' in df_filtrado.columns else pd.Series(dtype=float)
+                pie_buy_sell = {
+                    'buy_long': {
+                        'count': int((_pnl_series >= 0).sum()),
+                        'pnl': float(round(_pnl_series[_pnl_series >= 0].sum(), 2)) if not _pnl_series.empty else 0.0
+                    },
+                    'sell_short': {
+                        'count': int((_pnl_series < 0).sum()),
+                        'pnl': float(round(_pnl_series[_pnl_series < 0].sum(), 2)) if not _pnl_series.empty else 0.0
+                    }
+                }
+
+        # Série por granularidade
+        granularity_data = {}
+        if granularity and 'entry_date' in df_filtrado.columns:
+            _dfg = df_filtrado.dropna(subset=['entry_date', 'pnl']).copy()
+            if not _dfg.empty:
+                if granularity == 'weekly':
+                    _dfg['bucket'] = _dfg['entry_date'].dt.to_period('W').astype(str)
+                elif granularity == 'monthly':
+                    _dfg['bucket'] = _dfg['entry_date'].dt.to_period('M').astype(str)
+                elif granularity == 'yearly':
+                    _dfg['bucket'] = _dfg['entry_date'].dt.to_period('Y').astype(str)
+                else:
+                    _dfg['bucket'] = _dfg['entry_date'].dt.date.astype(str)
+                _grp = _dfg.groupby('bucket')['pnl'].agg(['count','sum','mean']).round(2)
+                granularity_data = {str(i): {'count': int(r['count']), 'sum': float(r['sum']), 'mean': float(r['mean'])} for i, r in _grp.iterrows()}
         
         # Extrair listas únicas para filtros
-        available_assets = sorted([str(symbol) for symbol in df_consolidado['symbol'].unique() if pd.notna(symbol)])
+        available_assets = sorted([str(symbol) for symbol in df_filtrado['symbol'].unique() if pd.notna(symbol)]) if 'symbol' in df_filtrado.columns else []
         # Extrair estratégias únicas dos trades processados
         available_strategies = sorted(list(set([trade['strategy'] for trade in trades if trade['strategy']])))
+        available_weekdays = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+        available_months = sorted(list(df_consolidado['entry_date'].dropna().dt.to_period('M').astype(str).unique())) if 'entry_date' in df_consolidado.columns else []
 
         resultado = {
             "trades": trades,
@@ -2218,15 +2295,29 @@ def api_trades():
                 "costs": custos
             },
             "filters": {
-                "available_assets": available_assets,
-                "available_strategies": available_strategies
+                "applied": {
+                    "date": filter_date,
+                    "weekday": filter_weekday,
+                    "month": filter_month,
+                    "granularity": granularity
+                },
+                "available": {
+                    "assets": available_assets,
+                    "strategies": available_strategies,
+                    "weekdays": available_weekdays,
+                    "months": available_months
+                }
+            },
+            "charts": {
+                "pie_buy_sell": pie_buy_sell,
+                "granularity": granularity_data
             },
             "metadata": {
                 "total_records": len(df_consolidado),
                 "valid_trades": len(trades),
                 "date_range": {
-                    "start": df_consolidado['entry_date'].min().isoformat() if df_consolidado['entry_date'].notna().any() else None,
-                    "end": df_consolidado['entry_date'].max().isoformat() if df_consolidado['entry_date'].notna().any() else None
+                    "start": df_consolidado['entry_date'].min().isoformat() if 'entry_date' in df_consolidado.columns and df_consolidado['entry_date'].notna().any() else None,
+                    "end": df_consolidado['entry_date'].max().isoformat() if 'entry_date' in df_consolidado.columns and df_consolidado['entry_date'].notna().any() else None
                 },
                 "info_arquivos": {
                     "total_arquivos": len(arquivos_processados),
