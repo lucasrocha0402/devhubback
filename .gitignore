@@ -1,0 +1,43 @@
+venv_new/
+__pycache__/
+*.pyc
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+*.coverage
+.coverage*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Ambientes virtuais
+venv/
+venv_new/
+.env
+.env.*
+!.env.example
+
+# Logs, PIDs e artefatos locais
+logs/
+*.log
+*.pid
+backend.log
+backend.pid
+
+# Cache/builds
+.dist/
+build/
+.cache/
+
+# SO/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Dados locais e arquivos grandes (se não forem necessários no repo)
+saved_analyses/
+*.csv
