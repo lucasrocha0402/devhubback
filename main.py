@@ -108,7 +108,7 @@ def root():
             "/api/trades/summary",
             "/api/trades/daily-metrics",
             "/api/trades/metrics-from-data",
-            "/chat"
+            "/api/upload-instructions"
         ]
     })
 
@@ -120,6 +120,41 @@ def health():
         "timestamp": datetime.now().isoformat(),
         "service": "devhub-backend",
         "openai_key_detected": bool(os.getenv("OPENAI_API_KEY"))
+    })
+
+# ============ INSTRUÇÕES PARA UPLOAD (CSV/XLS) ==========
+@app.route('/api/upload-instructions', methods=['GET'])
+def upload_instructions():
+    """Instruções simples de como exportar CSV/XLS do MetaTrader e como preparar o arquivo."""
+    return jsonify({
+        "title": "Como exportar seu arquivo do MetaTrader",
+        "sections": [
+            {
+                "label": "Exportar CSV (recomendado)",
+                "steps": [
+                    "Abra o MetaTrader (MT4/MT5) e vá em Histórico de Conta.",
+                    "Clique com o botão direito > Salvar como relatório > Escolha CSV.",
+                    "Defina período desejado e confirme.",
+                    "Envie o CSV na página de upload."
+                ]
+            },
+            {
+                "label": "Exportar XLS (alternativo)",
+                "steps": [
+                    "No relatório do MetaTrader, selecione Exportar como XLS (quando disponível).",
+                    "Salve o arquivo. Se necessário, abra no Excel e salve como CSV UTF-8.",
+                    "Envie o arquivo na página de upload."
+                ]
+            },
+            {
+                "label": "Dicas",
+                "steps": [
+                    "Certifique-se que colunas de data/hora e resultado (pnl) estejam presentes.",
+                    "Evite edições manuais que alterem separadores (ponto e vírgula vs vírgula).",
+                    "Se o CSV usar separador ';' e vírgula como decimal, o backend trata automaticamente."
+                ]
+            }
+        ]
     })
 
 @app.route('/api/test-metrics', methods=['POST'])
@@ -2093,44 +2128,10 @@ def api_correlacao_data_direcao():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    data = request.get_json(silent=True) or {}
-    # Debug leve: registrar headers e presença de chave (mascarando valor)
-    try:
-        hdr_key = request.headers.get('x-openai-key') or (request.headers.get('Authorization') or '').replace('Bearer ', '')
-        masked = (hdr_key[:6] + '...' + hdr_key[-4:]) if hdr_key else None
-        print(f"[/chat] headers received: x-openai-key present={bool(request.headers.get('x-openai-key'))}, auth_present={bool(request.headers.get('Authorization'))}, key={masked}")
-        print(f"[/chat] body keys: {list(data.keys())}")
-    except Exception:
-        pass
-    messages = data.get('messages', [])
-
-    try:
-        # SDK v1.x requer cliente explícito quando variável de ambiente não está carregada no processo
-        # Prioridades para obter a chave: Header -> Authorization Bearer -> Body -> Env
-        api_key = (
-            request.headers.get('x-openai-key')
-            or (request.headers.get('Authorization') or '').replace('Bearer ', '').strip() or None
-            or (data.get('apiKey') if isinstance(data, dict) else None)
-            or os.getenv("OPENAI_API_KEY")
-        )
-        if not api_key:
-            return jsonify({"error": "OPENAI_API_KEY não disponível. Envie no header 'x-openai-key' ou configure no backend."}), 500
-        client = _OpenAIClient(api_key=api_key)
-        # usar modelo disponível (gpt-4o-mini é mais acessível)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            stream=False
-        )
-        # extrai role + content
-        choice = resp.choices[0].message
-        return jsonify({
-            "role": choice.role,
-            "content": choice.content
-        }), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # Temporariamente desabilitado para o sprint "Muito fácil"
+    return jsonify({
+        "error": "Chat com IA temporariamente desabilitado."
+    }), 503
 
 # ============ NOVAS ROTAS PARA TRADES ============
 
