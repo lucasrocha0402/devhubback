@@ -38,6 +38,9 @@ CORS(app, origins=[
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
+# Estado em memória (temporário) para simular alteração de plano no ADMIN
+_ADMIN_USER_PLANS = {}
+
 # Custom JSON provider para lidar com tipos numpy (Flask 2.3+)
 from flask.json.provider import JSONProvider
 import json
@@ -156,6 +159,26 @@ def upload_instructions():
             }
         ]
     })
+
+# ============ ADMIN: ALTERAR PLANO DO USUÁRIO (TEMPORÁRIO) ==========
+@app.route('/api/admin/users/plan', methods=['POST'])
+def admin_update_user_plan():
+    """Atualiza o plano do usuário (simulação em memória)."""
+    try:
+        data = request.get_json(silent=True) or request.form
+        user_id = str(data.get('user_id') or '').strip()
+        new_plan = str(data.get('new_plan') or '').strip()
+        if not user_id or not new_plan:
+            return jsonify({"error": "Parâmetros obrigatórios: user_id, new_plan"}), 400
+        # Simular atualização em memória
+        _ADMIN_USER_PLANS[user_id] = new_plan
+        return jsonify({
+            "message": "Plano atualizado (temporário, não persistido)",
+            "user_id": user_id,
+            "new_plan": new_plan
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/test-metrics', methods=['POST'])
 def test_metrics():
