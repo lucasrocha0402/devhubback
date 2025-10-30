@@ -1954,9 +1954,9 @@ def api_tabela():
     Endpoint para processar arquivo único de backtest
     Suporta tanto arquivo único quanto múltiplos arquivos
     """
-    print("🔍 DEBUG: api_tabela chamada!")
-    print(f"🔍 DEBUG: request.files: {list(request.files.keys())}")
-    print(f"🔍 DEBUG: request.form: {list(request.form.keys())}")
+    print("[DEBUG] api_tabela chamada!")
+    print(f"[DEBUG] request.files: {list(request.files.keys())}")
+    print(f"[DEBUG] request.form: {list(request.form.keys())}")
     
     try:
         # Lista para armazenar todos os DataFrames
@@ -1966,16 +1966,16 @@ def api_tabela():
         # Verificar se tem arquivo único
         if 'file' in request.files:
             arquivo = request.files['file']
-            print(f"🔍 DEBUG: Arquivo recebido: {arquivo.filename}")
-            print(f"🔍 DEBUG: Tipo do arquivo: {type(arquivo)}")
+            print(f"[DEBUG] Arquivo recebido: {arquivo.filename}")
+            print(f"[DEBUG] Tipo do arquivo: {type(arquivo)}")
             if arquivo.filename != '':
                 try:
                     df = carregar_csv_safe(arquivo)
                     dataframes.append(df)
                     arquivos_processados.append(arquivo.filename)
-                    print(f"🔍 DEBUG: Arquivo processado com sucesso")
+                    print(f"[DEBUG] Arquivo processado com sucesso")
                 except Exception as e:
-                    print(f"🔍 DEBUG: Erro ao processar arquivo: {e}")
+                    print(f"[DEBUG] Erro ao processar arquivo: {e}")
                     raise e
         
         # Verificar se tem múltiplos arquivos
@@ -2000,9 +2000,9 @@ def api_tabela():
         if not dataframes:
             return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
         
-        print(f"🔍 DEBUG: dataframes encontrados: {len(dataframes)}")
+        print(f"[DEBUG] dataframes encontrados: {len(dataframes)}")
         for i, df in enumerate(dataframes):
-            print(f"🔍 DEBUG: DataFrame {i}: shape={df.shape}, columns={df.columns.tolist()}")
+            print(f"[DEBUG] DataFrame {i}: shape={df.shape}, columns={df.columns.tolist()}")
         
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
@@ -2012,17 +2012,17 @@ def api_tabela():
         cdi = float(request.form.get('cdi', 0.12))
         
         # Usar processar_backtest_completo
-        print(f"🔍 DEBUG: DataFrame shape: {df_consolidado.shape}")
-        print(f"🔍 DEBUG: DataFrame columns: {df_consolidado.columns.tolist()}")
-        print(f"🔍 DEBUG: Primeiras linhas: {df_consolidado.head()}")
+        print(f"[DEBUG] DataFrame shape: {df_consolidado.shape}")
+        print(f"[DEBUG] DataFrame columns: {df_consolidado.columns.tolist()}")
+        print(f"[DEBUG] Primeiras linhas: {df_consolidado.head()}")
         
         resultado = processar_backtest_completo(df_consolidado, capital_inicial=capital_inicial, cdi=cdi)
         
-        print(f"🔍 DEBUG: Resultado keys: {resultado.keys()}")
+        print(f"[DEBUG] Resultado keys: {resultado.keys()}")
         if 'Performance Metrics' in resultado:
-            print(f"🔍 DEBUG: Performance Metrics: {resultado['Performance Metrics']}")
+            print(f"[DEBUG] Performance Metrics: {resultado['Performance Metrics']}")
         else:
-            print("🔍 DEBUG: Performance Metrics não encontrado")
+            print("[DEBUG] Performance Metrics não encontrado")
         
         # Verificar se equity_curve_data existe, se não, gerar
         if 'equity_curve_data' not in resultado:
