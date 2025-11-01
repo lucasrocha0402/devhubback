@@ -864,13 +864,24 @@ def carregar_csv_safe(file_path_or_file):
         df = None
         last_error = None
         
+        # Ler conteúdo em buffer para múltiplas tentativas
+        import io
+        file_content = None
+        if hasattr(file_path_or_file, 'read'):
+            file_content = file_path_or_file.read()
+            if isinstance(file_content, bytes):
+                pass  # já está em bytes
+            else:
+                file_content = file_content.encode('utf-8')
+        
         for encoding in encodings_to_try:
             for format_config in formats_to_try:
                 try:
-                    if hasattr(file_path_or_file, 'read'):
-                        file_path_or_file.seek(0)  # Reset file pointer
+                    if file_content is not None:
+                        # Usar buffer em vez de seek
+                        buffer = io.BytesIO(file_content)
                         format_config['encoding'] = encoding
-                        df = pd.read_csv(file_path_or_file, **format_config)
+                        df = pd.read_csv(buffer, **format_config)
                     else:
                         format_config['encoding'] = encoding
                         df = pd.read_csv(file_path_or_file, **format_config)
@@ -879,13 +890,15 @@ def carregar_csv_safe(file_path_or_file):
                     expected_columns = ['entry_date', 'exit_date', 'pnl', 'Abertura', 'Fechamento', 'Res. Operação', 'Res. Intervalo']
                     found_columns = [col for col in expected_columns if col in df.columns]
                     
-                    if found_columns:
+                    if found_columns or len(df.columns) >= 5:
                         break
                     else:
+                        df = None
                         continue
                         
                 except Exception as e:
                     last_error = e
+                    df = None
                     continue
             
             if df is not None and len(df.columns) > 0:
