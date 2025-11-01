@@ -54,6 +54,8 @@ _ADMIN_PLAN_LIMITS = {
     'PRO3': {'tokens': 10000, 'robots': -1, 'portfolios': -1, 'analyses': -1},
     'BUSINESS': {'tokens': 50000, 'robots': -1, 'portfolios': -1, 'analyses': -1}
 }
+# Estado em memória para uso de tokens por usuário (temporário)
+_USER_TOKEN_USAGE = {}  # { user_id: { tokens_used, robots_created, portfolios_created, analyses_run } }
 
 # Evitar UnicodeEncodeError em consoles Windows (emojis/logs)
 import sys as _sys
@@ -505,6 +507,138 @@ def diary_calculate_with_commissions():
             "daily": daily_list,
             "commissions_applied": bool(custom_commissions)
         })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ TOKENS/LIMITES: CONSULTAR USO E VALIDAR ==========
+@app.route('/api/user/usage', methods=['GET'])
+def get_user_usage():
+    """Retorna uso atual de tokens/recursos do usuário."""
+    try:
+        # TODO: Obter user_id do token de autenticação
+        user_id = request.args.get('user_id', 'demo_user')
+        user_plan = _ADMIN_USER_PLANS.get(user_id, 'FREE')
+        
+        # Limites do plano
+        plan_limits = _ADMIN_PLAN_LIMITS.get(user_plan, _ADMIN_PLAN_LIMITS['FREE'])
+        
+        # Uso atual
+        usage = _USER_TOKEN_USAGE.get(user_id, {
+            'tokens_used': 0,
+            'robots_created': 0,
+            'portfolios_created': 0,
+            'analyses_run': 0
+        })
+        
+        # Calcular disponibilidade
+        def calc_available(used, limit):
+            if limit == -1:  # ilimitado
+                return -1
+            return max(0, limit - used)
+        
+        return jsonify({
+            "user_id": user_id,
+            "plan": user_plan,
+            "limits": plan_limits,
+            "usage": usage,
+            "available": {
+                "tokens": calc_available(usage['tokens_used'], plan_limits['tokens']),
+                "robots": calc_available(usage['robots_created'], plan_limits['robots']),
+                "portfolios": calc_available(usage['portfolios_created'], plan_limits['portfolios']),
+                "analyses": calc_available(usage['analyses_run'], plan_limits['analyses'])
+            }
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/user/consume', methods=['POST'])
+def consume_tokens():
+    """Consome tokens/recursos e valida limites antes de permitir ação."""
+    try:
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id', 'demo_user'))
+        resource = str(data.get('resource', 'tokens'))  # tokens | robots | portfolios | analyses
+        amount = int(data.get('amount', 1))
+        
+        user_plan = _ADMIN_USER_PLANS.get(user_id, 'FREE')
+        plan_limits = _ADMIN_PLAN_LIMITS.get(user_plan, _ADMIN_PLAN_LIMITS['FREE'])
+        
+        # Inicializar uso se não existir
+        if user_id not in _USER_TOKEN_USAGE:
+            _USER_TOKEN_USAGE[user_id] = {
+                'tokens_used': 0,
+                'robots_created': 0,
+                'portfolios_created': 0,
+                'analyses_run': 0
+            }
+        
+        usage = _USER_TOKEN_USAGE[user_id]
+        
+        # Mapear resource para chave de uso
+        resource_map = {
+            'tokens': ('tokens_used', 'tokens'),
+            'robots': ('robots_created', 'robots'),
+            'portfolios': ('portfolios_created', 'portfolios'),
+            'analyses': ('analyses_run', 'analyses')
+        }
+        
+        if resource not in resource_map:
+            return jsonify({"error": f"Recurso '{resource}' inválido"}), 400
+        
+        usage_key, limit_key = resource_map[resource]
+        current_usage = usage[usage_key]
+        limit = plan_limits[limit_key]
+        
+        # Validar se há limite disponível
+        if limit != -1 and (current_usage + amount) > limit:
+            return jsonify({
+                "error": f"Limite de {resource} excedido",
+                "current": current_usage,
+                "limit": limit,
+                "requested": amount,
+                "available": max(0, limit - current_usage)
+            }), 403
+        
+        # Consumir recurso
+        usage[usage_key] += amount
+        
+        return jsonify({
+            "message": f"{amount} {resource} consumido(s) com sucesso",
+            "usage": usage,
+            "remaining": limit - usage[usage_key] if limit != -1 else -1
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/admin/user-usage', methods=['GET', 'POST'])
+def admin_manage_user_usage():
+    """Admin: visualizar e resetar uso de usuários."""
+    try:
+        if request.method == 'GET':
+            # Listar uso de todos os usuários
+            return jsonify({"users": _USER_TOKEN_USAGE})
+        
+        if request.method == 'POST':
+            # Resetar uso de um usuário
+            data = request.get_json(silent=True) or {}
+            user_id = str(data.get('user_id', '')).strip()
+            
+            if not user_id:
+                return jsonify({"error": "user_id obrigatório"}), 400
+            
+            if user_id in _USER_TOKEN_USAGE:
+                _USER_TOKEN_USAGE[user_id] = {
+                    'tokens_used': 0,
+                    'robots_created': 0,
+                    'portfolios_created': 0,
+                    'analyses_run': 0
+                }
+                return jsonify({"message": f"Uso de {user_id} resetado"})
+            else:
+                return jsonify({"error": "Usuário não encontrado"}), 404
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
