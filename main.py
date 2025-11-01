@@ -1249,40 +1249,6 @@ def calcular_custos_operacionais(df: pd.DataFrame, taxa_corretagem: float = 0.5,
 
 # ============ FUNÇÕES PARA MÉTRICAS DIÁRIAS ============
 
-def calcular_metricas_diarias(df: pd.DataFrame) -> Dict[str, Any]:
-    """Calcula métricas diárias baseadas nas trades"""
-    if df.empty:
-        return {}
-    
-    # Filtrar trades válidas
-    df_valid = df.dropna(subset=['pnl', 'entry_date'])
-    
-    if df_valid.empty:
-        return {}
-    
-    # Agrupar por dia
-    df_valid['date'] = df_valid['entry_date'].dt.date
-    daily_stats = df_valid.groupby('date').agg({
-        'pnl': ['sum', 'count', 'mean'],
-    }).round(2)
-    
-    daily_stats.columns = ['total_pnl', 'total_trades', 'avg_pnl']
-    daily_stats['win_rate'] = df_valid.groupby('date').apply(
-        lambda x: (x['pnl'] > 0).sum() / len(x) * 100
-    ).round(2)
-    
-    # Calcular sequências de dias
-    daily_stats['is_winner'] = daily_stats['total_pnl'] > 0
-    daily_stats['is_loser'] = daily_stats['total_pnl'] < 0
-    
-    # Calcular drawdown
-    daily_stats['cumulative_pnl'] = daily_stats['total_pnl'].cumsum()
-    daily_stats['running_max'] = daily_stats['cumulative_pnl'].expanding().max()
-    daily_stats['drawdown'] = daily_stats['cumulative_pnl'] - daily_stats['running_max']
-    
-
-    return daily_stats
-
 def calcular_metricas_diarias(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcula métricas diárias baseadas nas trades com drawdown correto
