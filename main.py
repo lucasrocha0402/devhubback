@@ -156,7 +156,9 @@ def root():
             "/api/trades/summary",
             "/api/trades/daily-metrics",
             "/api/trades/metrics-from-data",
-            "/api/upload-instructions"
+            "/api/upload-instructions",
+            "/api/calendar-results",
+            "/api/hourly-results"
         ]
     })
 
@@ -506,6 +508,296 @@ def diary_calculate_with_commissions():
             },
             "daily": daily_list,
             "commissions_applied": bool(custom_commissions)
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ CALENDÁRIO DE RESULTADOS (GRANULARIDADE ESTRATÉGICA) ==========
+@app.route('/api/calendar-results', methods=['POST'])
+def calendar_results():
+    """
+    Calendário de Resultados com granularidade diária, semanal e mensal.
+    Olhar estratégico similar ao diário quântico.
+    """
+    try:
+        # Carregar arquivo
+        if 'file' in request.files:
+            df = carregar_csv_trades(request.files['file'])
+        elif 'files' in request.files:
+            dataframes = []
+            for file in request.files.getlist('files'):
+                if file.filename:
+                    df = carregar_csv_trades(file)
+                    dataframes.append(df)
+            df = pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
+        elif 'path' in request.form:
+            path = request.form['path']
+            if not os.path.exists(path):
+                return jsonify({"error": "Arquivo não encontrado"}), 404
+            df = carregar_csv_trades(path)
+        else:
+            return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
+        
+        if df.empty:
+            return jsonify({"error": "DataFrame vazio"}), 400
+        
+        granularity = request.form.get('granularity', 'daily')  # daily | weekly | monthly
+        
+        # Normalizar datas
+        if 'entry_date' in df.columns:
+            df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
+        if 'pnl' not in df.columns:
+            return jsonify({"error": "Coluna 'pnl' não encontrada"}), 400
+        
+        df_valid = df.dropna(subset=['entry_date', 'pnl']).copy()
+        df_valid = df_valid.sort_values('entry_date')
+        
+        # Calcular saldo cumulativo
+        df_valid['saldo_cumulativo'] = df_valid['pnl'].cumsum()
+        df_valid['peak'] = df_valid['saldo_cumulativo'].cummax()
+        df_valid['drawdown'] = df_valid['saldo_cumulativo'] - df_valid['peak']
+        
+        results = []
+        
+        if granularity == 'daily':
+            # Agrupar por data
+            df_valid['date'] = df_valid['entry_date'].dt.date
+            grouped = df_valid.groupby('date').agg({
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum()],
+                'saldo_cumulativo': 'last',
+                'peak': 'last',
+                'drawdown': 'min'
+            })
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'saldo_final', 'peak_final', 'drawdown_min']
+            grouped = grouped.reset_index()
+            
+            for _, row in grouped.iterrows():
+                win_rate = (row['wins'] / row['trades'] * 100) if row['trades'] > 0 else 0
+                results.append({
+                    'period': row['date'].isoformat(),
+                    'label': row['date'].strftime('%d/%m/%Y'),
+                    'trades': int(row['trades']),
+                    'pnl_total': float(round(row['pnl_total'], 2)),
+                    'win_rate': float(round(win_rate, 2)),
+                    'saldo_final': float(round(row['saldo_final'], 2)),
+                    'drawdown': float(round(row['drawdown_min'], 2))
+                })
+        
+        elif granularity == 'weekly':
+            # Semana do mês (1-5)
+            df_valid['week_of_month'] = ((df_valid['entry_date'].dt.day - 1) // 7) + 1
+            grouped = df_valid.groupby('week_of_month').agg({
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum()],
+                'saldo_cumulativo': 'last',
+                'peak': 'last',
+                'drawdown': 'min'
+            })
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'saldo_final', 'peak_final', 'drawdown_min']
+            grouped = grouped.reset_index()
+            
+            for _, row in grouped.iterrows():
+                win_rate = (row['wins'] / row['trades'] * 100) if row['trades'] > 0 else 0
+                results.append({
+                    'period': f"semana_{int(row['week_of_month'])}",
+                    'label': f"Semana {int(row['week_of_month'])}",
+                    'trades': int(row['trades']),
+                    'pnl_total': float(round(row['pnl_total'], 2)),
+                    'win_rate': float(round(win_rate, 2)),
+                    'saldo_final': float(round(row['saldo_final'], 2)),
+                    'drawdown': float(round(row['drawdown_min'], 2))
+                })
+        
+        elif granularity == 'monthly':
+            # Mês do ano (agrupa todos os janeiros, fevereiros, etc.)
+            import calendar
+            df_valid['month_num'] = df_valid['entry_date'].dt.month
+            grouped = df_valid.groupby('month_num').agg({
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum()],
+                'saldo_cumulativo': 'last',
+                'peak': 'last',
+                'drawdown': 'min'
+            })
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'saldo_final', 'peak_final', 'drawdown_min']
+            grouped = grouped.reset_index()
+            
+            for _, row in grouped.iterrows():
+                month_name = calendar.month_name[int(row['month_num'])]
+                win_rate = (row['wins'] / row['trades'] * 100) if row['trades'] > 0 else 0
+                results.append({
+                    'period': month_name.lower(),
+                    'label': month_name,
+                    'trades': int(row['trades']),
+                    'pnl_total': float(round(row['pnl_total'], 2)),
+                    'win_rate': float(round(win_rate, 2)),
+                    'saldo_final': float(round(row['saldo_final'], 2)),
+                    'drawdown': float(round(row['drawdown_min'], 2))
+                })
+        
+        # Calcular resumo estratégico
+        if results:
+            best_period = max(results, key=lambda x: x['pnl_total'])
+            worst_period = min(results, key=lambda x: x['pnl_total'])
+            total_pnl = sum(r['pnl_total'] for r in results)
+            avg_win_rate = sum(r['win_rate'] for r in results) / len(results) if results else 0
+        else:
+            best_period = worst_period = None
+            total_pnl = 0
+            avg_win_rate = 0
+        
+        return jsonify({
+            'granularity': granularity,
+            'summary': {
+                'total_periods': len(results),
+                'total_pnl': float(round(total_pnl, 2)),
+                'avg_win_rate': float(round(avg_win_rate, 2)),
+                'best_period': best_period,
+                'worst_period': worst_period
+            },
+            'results': results
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ RESULTADO POR HORÁRIO (PERÍODOS PERSONALIZADOS) ==========
+@app.route('/api/hourly-results', methods=['POST'])
+def hourly_results():
+    """
+    Resultado por horário com períodos personalizados.
+    Base para expansão na Fase 3.
+    """
+    try:
+        # Carregar arquivo
+        if 'file' in request.files:
+            df = carregar_csv_trades(request.files['file'])
+        elif 'files' in request.files:
+            dataframes = []
+            for file in request.files.getlist('files'):
+                if file.filename:
+                    df = carregar_csv_trades(file)
+                    dataframes.append(df)
+            df = pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
+        elif 'path' in request.form:
+            path = request.form['path']
+            if not os.path.exists(path):
+                return jsonify({"error": "Arquivo não encontrado"}), 404
+            df = carregar_csv_trades(path)
+        else:
+            return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
+        
+        if df.empty:
+            return jsonify({"error": "DataFrame vazio"}), 400
+        
+        # Períodos personalizados (formato JSON string)
+        # Ex: [{"start": "09:00", "end": "10:00", "label": "Pré-Mercado"}, ...]
+        custom_periods_json = request.form.get('custom_periods')
+        
+        # Períodos padrão
+        default_periods = [
+            {"start": "09:00", "end": "10:00", "label": "Pré-Mercado"},
+            {"start": "10:00", "end": "12:00", "label": "Manhã"},
+            {"start": "12:00", "end": "14:00", "label": "Almoço"},
+            {"start": "14:00", "end": "16:00", "label": "Tarde"},
+            {"start": "16:00", "end": "18:00", "label": "Pós-Mercado"}
+        ]
+        
+        # Usar períodos customizados se fornecidos
+        if custom_periods_json:
+            import json
+            try:
+                periods = json.loads(custom_periods_json)
+            except Exception:
+                periods = default_periods
+        else:
+            periods = default_periods
+        
+        # Normalizar datas
+        if 'entry_date' in df.columns:
+            df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
+        if 'pnl' not in df.columns:
+            return jsonify({"error": "Coluna 'pnl' não encontrada"}), 400
+        
+        df_valid = df.dropna(subset=['entry_date', 'pnl']).copy()
+        df_valid['hour'] = df_valid['entry_date'].dt.hour
+        df_valid['minute'] = df_valid['entry_date'].dt.minute
+        df_valid['time_decimal'] = df_valid['hour'] + df_valid['minute'] / 60.0
+        
+        results = []
+        
+        for period in periods:
+            # Parse start/end (formato HH:MM)
+            start_parts = period['start'].split(':')
+            end_parts = period['end'].split(':')
+            start_decimal = int(start_parts[0]) + int(start_parts[1]) / 60.0
+            end_decimal = int(end_parts[0]) + int(end_parts[1]) / 60.0
+            
+            # Filtrar trades no período
+            mask = (df_valid['time_decimal'] >= start_decimal) & (df_valid['time_decimal'] < end_decimal)
+            period_df = df_valid[mask]
+            
+            if len(period_df) == 0:
+                results.append({
+                    'period': f"{period['start']}-{period['end']}",
+                    'label': period.get('label', f"{period['start']}-{period['end']}"),
+                    'trades': 0,
+                    'win_rate': 0.0,
+                    'profit_factor': 0.0,
+                    'pnl_total': 0.0,
+                    'avg_win': 0.0,
+                    'avg_loss': 0.0
+                })
+                continue
+            
+            # Calcular métricas do período
+            total_trades = len(period_df)
+            wins = period_df[period_df['pnl'] > 0]
+            losses = period_df[period_df['pnl'] < 0]
+            
+            win_count = len(wins)
+            loss_count = len(losses)
+            win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0
+            
+            gross_profit = wins['pnl'].sum() if len(wins) > 0 else 0
+            gross_loss = abs(losses['pnl'].sum()) if len(losses) > 0 else 0
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0)
+            
+            avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
+            avg_loss = abs(losses['pnl'].mean()) if len(losses) > 0 else 0
+            
+            pnl_total = period_df['pnl'].sum()
+            
+            results.append({
+                'period': f"{period['start']}-{period['end']}",
+                'label': period.get('label', f"{period['start']}-{period['end']}"),
+                'trades': int(total_trades),
+                'win_rate': float(round(win_rate, 2)),
+                'profit_factor': float(round(profit_factor if profit_factor != float('inf') else 99.99, 2)),
+                'pnl_total': float(round(pnl_total, 2)),
+                'avg_win': float(round(avg_win, 2)),
+                'avg_loss': float(round(avg_loss, 2)),
+                'winning_trades': int(win_count),
+                'losing_trades': int(loss_count)
+            })
+        
+        # Resumo
+        if results:
+            best_period = max((r for r in results if r['trades'] > 0), key=lambda x: x['pnl_total'], default=None)
+            worst_period = min((r for r in results if r['trades'] > 0 and r['pnl_total'] < 0), key=lambda x: x['pnl_total'], default=None)
+            total_pnl = sum(r['pnl_total'] for r in results)
+        else:
+            best_period = worst_period = None
+            total_pnl = 0
+        
+        return jsonify({
+            'summary': {
+                'total_periods': len([r for r in results if r['trades'] > 0]),
+                'total_pnl': float(round(total_pnl, 2)),
+                'best_period': best_period,
+                'worst_period': worst_period
+            },
+            'results': results,
+            'custom_periods': periods
         })
     
     except Exception as e:
