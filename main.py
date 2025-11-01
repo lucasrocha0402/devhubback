@@ -43,6 +43,17 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 _ADMIN_USER_PLANS = {}
 # Estado em memória para custos personalizados por ativo (temporário)
 _ADMIN_ASSET_COSTS = {}
+# Estado em memória para eventos especiais (temporário)
+_ADMIN_EVENTS = {}
+# Estado em memória para limites por plano (temporário)
+_ADMIN_PLAN_LIMITS = {
+    'FREE': {'tokens': 100, 'robots': 0, 'portfolios': 0, 'analyses': 5},
+    'STARTER': {'tokens': 500, 'robots': 0, 'portfolios': 0, 'analyses': 20},
+    'PRO1': {'tokens': 2000, 'robots': 3, 'portfolios': 2, 'analyses': 100},
+    'PRO2': {'tokens': 5000, 'robots': 10, 'portfolios': 5, 'analyses': -1},
+    'PRO3': {'tokens': 10000, 'robots': -1, 'portfolios': -1, 'analyses': -1},
+    'BUSINESS': {'tokens': 50000, 'robots': -1, 'portfolios': -1, 'analyses': -1}
+}
 
 # Evitar UnicodeEncodeError em consoles Windows (emojis/logs)
 import sys as _sys
@@ -249,6 +260,137 @@ def admin_asset_costs():
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ============ ADMIN: EVENTOS ESPECIAIS (CRUD) ==========
+@app.route('/api/admin/events', methods=['GET', 'POST', 'DELETE'])
+def admin_events():
+    """CRUD de eventos especiais (feriados, resultados, dados econômicos)."""
+    try:
+        if request.method == 'GET':
+            # Listar todos os eventos
+            events_list = [{'id': k, **v} for k, v in _ADMIN_EVENTS.items()]
+            return jsonify({"events": events_list})
+        
+        data = request.get_json(silent=True) or request.form
+        
+        if request.method == 'POST':
+            # Criar evento
+            event_id = str(len(_ADMIN_EVENTS) + 1)
+            date = str(data.get('date') or '').strip()
+            name = str(data.get('name') or '').strip()
+            event_type = str(data.get('type', 'economic')).strip()
+            impact = str(data.get('impact', 'medium')).strip()
+            
+            if not date or not name:
+                return jsonify({"error": "Campos 'date' e 'name' obrigatórios"}), 400
+            
+            _ADMIN_EVENTS[event_id] = {
+                "date": date,
+                "name": name,
+                "type": event_type,
+                "impact": impact
+            }
+            return jsonify({
+                "message": "Evento criado (temporário)",
+                "event": {"id": event_id, **_ADMIN_EVENTS[event_id]}
+            })
+        
+        if request.method == 'DELETE':
+            # Remover evento
+            event_id = str(data.get('id') or '').strip()
+            if not event_id or event_id not in _ADMIN_EVENTS:
+                return jsonify({"error": "Evento não encontrado"}), 404
+            del _ADMIN_EVENTS[event_id]
+            return jsonify({"message": f"Evento {event_id} removido"})
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ ADMIN: LIMITES POR PLANO (CRUD) ==========
+@app.route('/api/admin/plan-limits', methods=['GET', 'PUT'])
+def admin_plan_limits():
+    """Visualizar e atualizar limites de tokens/recursos por plano."""
+    try:
+        if request.method == 'GET':
+            return jsonify({"plans": _ADMIN_PLAN_LIMITS})
+        
+        if request.method == 'PUT':
+            data = request.get_json(silent=True) or {}
+            plan = str(data.get('plan') or '').strip().upper()
+            if plan not in _ADMIN_PLAN_LIMITS:
+                return jsonify({"error": "Plano não encontrado"}), 404
+            
+            tokens = data.get('tokens')
+            robots = data.get('robots')
+            portfolios = data.get('portfolios')
+            analyses = data.get('analyses')
+            
+            if tokens is not None:
+                _ADMIN_PLAN_LIMITS[plan]['tokens'] = int(tokens)
+            if robots is not None:
+                _ADMIN_PLAN_LIMITS[plan]['robots'] = int(robots)
+            if portfolios is not None:
+                _ADMIN_PLAN_LIMITS[plan]['portfolios'] = int(portfolios)
+            if analyses is not None:
+                _ADMIN_PLAN_LIMITS[plan]['analyses'] = int(analyses)
+            
+            return jsonify({
+                "message": f"Limites do plano {plan} atualizados (temporário)",
+                "limits": _ADMIN_PLAN_LIMITS[plan]
+            })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ PLANOS: LISTAR DISPONÍVEIS ==========
+@app.route('/api/plans', methods=['GET'])
+def list_plans():
+    """Lista todos os planos disponíveis com features e limites."""
+    plans = [
+        {
+            "id": "FREE",
+            "name": "Free",
+            "price": 0,
+            "features": ["Diário Quântico (limitado)", "5 análises/mês", "100 tokens"],
+            "limits": _ADMIN_PLAN_LIMITS.get('FREE', {})
+        },
+        {
+            "id": "STARTER",
+            "name": "Starter",
+            "price": 29.90,
+            "features": ["Diário Quântico completo", "20 análises/mês", "500 tokens"],
+            "limits": _ADMIN_PLAN_LIMITS.get('STARTER', {})
+        },
+        {
+            "id": "PRO1",
+            "name": "Pro 1",
+            "price": 99.90,
+            "features": ["Backtest Analysis", "Portfolio Manager", "3 robôs", "2 portfolios", "100 análises/mês"],
+            "limits": _ADMIN_PLAN_LIMITS.get('PRO1', {})
+        },
+        {
+            "id": "PRO2",
+            "name": "Pro 2",
+            "price": 199.90,
+            "features": ["Tudo do Pro 1", "10 robôs", "5 portfolios", "Análises ilimitadas"],
+            "limits": _ADMIN_PLAN_LIMITS.get('PRO2', {})
+        },
+        {
+            "id": "PRO3",
+            "name": "Pro 3",
+            "price": 399.90,
+            "features": ["Tudo ilimitado", "Suporte prioritário"],
+            "limits": _ADMIN_PLAN_LIMITS.get('PRO3', {})
+        },
+        {
+            "id": "BUSINESS",
+            "name": "Business",
+            "price": 999.90,
+            "features": ["Tudo ilimitado", "Compartilhamento por email", "API dedicada", "Suporte VIP"],
+            "limits": _ADMIN_PLAN_LIMITS.get('BUSINESS', {})
+        }
+    ]
+    return jsonify({"plans": plans})
 
 @app.route('/api/test-metrics', methods=['POST'])
 def test_metrics():
