@@ -404,6 +404,10 @@ def calcular_monthly(df, cdi=0.12):
     }
 
 def calcular_weekly(df, cdi=0.12):
+    """
+    Calcula análise por SEMANA DO MÊS (1ª a 5ª semana).
+    Agrupa todas as 1ªs semanas, todas as 2ªs semanas, etc.
+    """
     df = df.copy()
     
     # Determinar colunas
@@ -423,40 +427,81 @@ def calcular_weekly(df, cdi=0.12):
     else:
         return {}
     
-    df['WeekNum'] = df[date_col].dt.isocalendar().week
+    # Calcular semana do mês (1 a 5)
+    # Dia 1-7 = Semana 1, Dia 8-14 = Semana 2, etc.
+    df['DayOfMonth'] = df[date_col].dt.day
+    df['WeekOfMonth'] = ((df['DayOfMonth'] - 1) // 7) + 1
+    
+    # Ordenar por data de abertura para cálculo correto do drawdown
+    df = df.sort_values(date_col).reset_index(drop=True)
+    
+    # Calcular equity curve global para drawdown correto
+    df['Saldo'] = df[pnl_col].cumsum()
+    df['Saldo_Maximo'] = df['Saldo'].cummax()
+    df['Drawdown'] = df['Saldo'] - df['Saldo_Maximo']
+    
     stats = {}
-    weeks = sorted(df['WeekNum'].unique())
-    for w in weeks:
-        sub = df[df['WeekNum'] == w]
-        lucro, pf, sharpe, sharpe_simp, trades = calcular_metrics(sub, cdi=cdi)
-        wins = sub[sub[pnl_col] > 0]
-        losses = sub[sub[pnl_col] < 0]
-        win_rate = len(wins) / trades * 100 if trades > 0 else 0
+    
+    for w in range(1, 6):  # Semanas 1 a 5
+        sub = df[df['WeekOfMonth'] == w]
         
-        # Calcular média de ganho e perda
-        avg_win = wins[pnl_col].mean() if len(wins) > 0 else 0
-        avg_loss = abs(losses[pnl_col].mean()) if len(losses) > 0 else 0
-        
-        # Calcular rentabilidade total (lucro total do período)
-        rentabilidade_total = lucro
-        
-        stats[f"Semana {w}"] = {
-            "Trades": trades,
-            "Net Profit": lucro,
-            "Profit Factor": pf,
-            "Sharpe Ratio": sharpe,
-            "Sharpe DDx3": sharpe_simp,
-            "Win Rate (%)": round(win_rate, 2),
-            "Average Win": round(avg_win, 2),
-            "Average Loss": round(avg_loss, 2),
-            "Rentabilidade ($)": round(rentabilidade_total, 2)
-        }
-    best_week = max(stats.items(), key=lambda x: x[1]['Net Profit'])[0]
-    worst_week = min((item for item in stats.items() if item[1]['Net Profit'] < 0), key=lambda x: x[1]['Net Profit'], default=(None, {}))[0]
+        if len(sub) > 0:
+            lucro, pf, sharpe, sharpe_simp, trades = calcular_metrics(sub, cdi=cdi)
+            wins = sub[sub[pnl_col] > 0]
+            losses = sub[sub[pnl_col] < 0]
+            win_rate = len(wins) / trades * 100 if trades > 0 else 0
+            
+            # Calcular média de ganho e perda
+            avg_win = wins[pnl_col].mean() if len(wins) > 0 else 0
+            avg_loss = abs(losses[pnl_col].mean()) if len(losses) > 0 else 0
+            
+            # Calcular drawdown máximo da semana
+            max_drawdown_week = sub['Drawdown'].min() if not sub['Drawdown'].empty else 0
+            
+            # Calcular rentabilidade total (lucro total do período)
+            rentabilidade_total = lucro
+            
+            stats[f"Semana {w}"] = {
+                "Trades": trades,
+                "Net Profit": lucro,
+                "Profit Factor": pf,
+                "Sharpe Ratio": sharpe,
+                "Sharpe DDx3": sharpe_simp,
+                "Win Rate (%)": round(win_rate, 2),
+                "Average Win": round(avg_win, 2),
+                "Average Loss": round(avg_loss, 2),
+                "Max Drawdown ($)": round(max_drawdown_week, 2),
+                "Rentabilidade ($)": round(rentabilidade_total, 2)
+            }
+        else:
+            stats[f"Semana {w}"] = {
+                "Trades": 0,
+                "Net Profit": 0.0,
+                "Profit Factor": 0,
+                "Sharpe Ratio": 0,
+                "Win Rate (%)": 0.0,
+                "Max Drawdown ($)": 0.0,
+                "Rentabilidade ($)": 0.0
+            }
+    
+    # Filtrar apenas semanas com operações
+    semanas_com_operacoes = {k: v for k, v in stats.items() if v["Trades"] > 0}
+    
+    if semanas_com_operacoes:
+        best_week = max(semanas_com_operacoes.items(), key=lambda x: x[1]['Net Profit'])[0]
+        worst_week = min(
+            (item for item in semanas_com_operacoes.items() if item[1]['Net Profit'] < 0),
+            key=lambda x: x[1]['Net Profit'],
+            default=(None, {})
+        )[0]
+    else:
+        best_week = None
+        worst_week = None
+    
     return {
         "Stats": stats,
-        "Best Week": {"Week": best_week, **stats.get(best_week, {})},
-        "Worst Week": {"Week": worst_week, **stats.get(worst_week, {})}
+        "Best Week": {"Week": best_week, **stats.get(best_week, {})} if best_week else {"Week": None},
+        "Worst Week": {"Week": worst_week, **stats.get(worst_week, {})} if worst_week else {"Week": None}
     }
 
 def calcular_dados_grafico(df, capital_inicial=100000):
