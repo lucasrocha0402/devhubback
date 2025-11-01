@@ -23,6 +23,7 @@ dotenv.load_dotenv(dotenv_path=_path.join(_path.dirname(__file__), '..', 'projec
 
 # main.py
 app = Flask(__name__)
+app.config['JSON_AS_ASCII'] = False
 
 # Configuração CORS para permitir acesso do frontend
 CORS(app, origins=[
@@ -40,6 +41,35 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # Estado em memória (temporário) para simular alteração de plano no ADMIN
 _ADMIN_USER_PLANS = {}
+
+# Evitar UnicodeEncodeError em consoles Windows (emojis/logs)
+import sys as _sys
+try:
+    if hasattr(_sys.stdout, 'reconfigure'):
+        _sys.stdout.reconfigure(encoding='utf-8', errors='ignore')
+    if hasattr(_sys.stderr, 'reconfigure'):
+        _sys.stderr.reconfigure(encoding='utf-8', errors='ignore')
+except Exception:
+    pass
+
+# Patch de segurança para prints com emojis em consoles sem suporte
+try:
+    import builtins as _builtins
+    _orig_print = _builtins.print
+    def _safe_print(*args, **kwargs):
+        try:
+            return _orig_print(*args, **kwargs)
+        except UnicodeEncodeError:
+            sanitized = []
+            for a in args:
+                try:
+                    sanitized.append(str(a).encode('cp1252', 'ignore').decode('cp1252'))
+                except Exception:
+                    sanitized.append(str(a))
+            return _orig_print(*sanitized, **kwargs)
+    _builtins.print = _safe_print
+except Exception:
+    pass
 
 # Custom JSON provider para lidar com tipos numpy (Flask 2.3+)
 from flask.json.provider import JSONProvider
@@ -274,14 +304,34 @@ def clean_numeric_value(value):
         return np.nan
 
 def carregar_csv_trades(file_path_or_file):
-    """Carrega CSV da planilha de trades com mapeamento específico e parsing melhorado"""
+    """Carrega arquivo de trades (CSV padrão; tenta XLS/XLSX se disponível)."""
     try:
-        if hasattr(file_path_or_file, 'read'):
-            # É um arquivo upload - usar mesmos parâmetros da função original
-            df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='latin1', decimal=',')
+        filename = None
+        if hasattr(file_path_or_file, 'filename'):
+            filename = str(file_path_or_file.filename or '').lower()
+        elif isinstance(file_path_or_file, str):
+            filename = file_path_or_file.lower()
+
+        # Tentar Excel primeiro quando extensão indicar
+        if filename and (filename.endswith('.xlsx') or filename.endswith('.xls') or filename.endswith('.xlsm')):
+            try:
+                df = pd.read_excel(file_path_or_file)
+            except ImportError:
+                raise ValueError("Arquivo Excel recebido, mas 'openpyxl' não está instalado. Envie CSV ou instale openpyxl.")
+            except Exception as e:
+                raise ValueError(f"Erro ao ler Excel: {e}")
         else:
-            # É um caminho de arquivo
-            df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='latin1', decimal=',')
+            # CSV com configuração padrão MetaTrader (separador ';', 5 linhas de cabeçalho)
+            if hasattr(file_path_or_file, 'read'):
+                try:
+                    df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='utf-8-sig', decimal=',')
+                except Exception:
+                    df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='latin1', decimal=',')
+            else:
+                try:
+                    df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='utf-8-sig', decimal=',')
+                except Exception:
+                    df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='latin1', decimal=',')
         
         # Processar datas conforme função original - com verificação de colunas
         if 'Abertura' in df.columns:
@@ -348,13 +398,28 @@ def carregar_csv_trades(file_path_or_file):
         return df
         
     except Exception as e:
-        raise ValueError(f"Erro ao processar CSV: {e}")
+        raise ValueError(f"Erro ao processar arquivo de trades: {e}")
 
 # Função carregar_csv_safe melhorada com encoding robusto
 def carregar_csv_safe(file_path_or_file):
-    """Função auxiliar para carregar CSV com encoding seguro baseada na função original"""
+    """Carrega CSV de forma robusta; tenta XLS/XLSX quando detectado."""
     try:
-        # Tentar diferentes encodings e formatos
+        # Detectar Excel por extensão
+        filename = None
+        if hasattr(file_path_or_file, 'filename'):
+            filename = str(file_path_or_file.filename or '').lower()
+        elif isinstance(file_path_or_file, str):
+            filename = file_path_or_file.lower()
+
+        if filename and (filename.endswith('.xlsx') or filename.endswith('.xls') or filename.endswith('.xlsm')):
+            try:
+                return pd.read_excel(file_path_or_file)
+            except ImportError:
+                raise ValueError("Arquivo Excel recebido, mas 'openpyxl' não está instalado. Envie CSV ou instale openpyxl.")
+            except Exception as e:
+                raise ValueError(f"Erro ao ler Excel: {e}")
+
+        # Tentar diferentes encodings e formatos (CSV)
         encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
         formats_to_try = [
             {'skiprows': 0, 'sep': ',', 'encoding': None},
@@ -1593,29 +1658,6 @@ def api_disciplina_completa():
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
 
-        # Normalizar datas
-        if 'entry_date' in df_consolidado.columns:
-            df_consolidado['entry_date'] = pd.to_datetime(df_consolidado['entry_date'], errors='coerce')
-        if 'exit_date' in df_consolidado.columns:
-            df_consolidado['exit_date'] = pd.to_datetime(df_consolidado['exit_date'], errors='coerce')
-
-        # Aplicar filtros opcionais
-        df_filtrado = df_consolidado
-        try:
-            if filter_date and 'entry_date' in df_filtrado.columns:
-                _dia = pd.to_datetime(filter_date, errors='coerce').date()
-                df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.date == _dia]
-            if filter_weekday and 'entry_date' in df_filtrado.columns:
-                if str(filter_weekday).isdigit():
-                    _idx = int(filter_weekday)
-                    df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.weekday == _idx]
-                else:
-                    df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.day_name() == filter_weekday]
-            if filter_month and 'entry_date' in df_filtrado.columns:
-                df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.to_period('M').astype(str) == filter_month]
-        except Exception:
-            pass
-        
         # Calcular disciplina no DataFrame consolidado
         resultado = calcular_disciplina_completa(df_consolidado, fator_disciplina, multiplicador_furia)
         
@@ -2247,7 +2289,30 @@ def api_trades():
         
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
-        
+
+        # Normalizar datas
+        if 'entry_date' in df_consolidado.columns:
+            df_consolidado['entry_date'] = pd.to_datetime(df_consolidado['entry_date'], errors='coerce')
+        if 'exit_date' in df_consolidado.columns:
+            df_consolidado['exit_date'] = pd.to_datetime(df_consolidado['exit_date'], errors='coerce')
+
+        # Aplicar filtros opcionais
+        df_filtrado = df_consolidado
+        try:
+            if filter_date and 'entry_date' in df_filtrado.columns:
+                _dia = pd.to_datetime(filter_date, errors='coerce').date()
+                df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.date == _dia]
+            if filter_weekday and 'entry_date' in df_filtrado.columns:
+                if str(filter_weekday).isdigit():
+                    _idx = int(filter_weekday)
+                    df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.weekday == _idx]
+                else:
+                    df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.day_name() == filter_weekday]
+            if filter_month and 'entry_date' in df_filtrado.columns:
+                df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.to_period('M').astype(str) == filter_month]
+        except Exception:
+            pass
+
         # Processar dados filtrados com mapeamento de arquivos
         trades = processar_trades(df_filtrado, arquivo_para_indices)
         estatisticas_gerais = calcular_estatisticas_gerais(df_filtrado)
