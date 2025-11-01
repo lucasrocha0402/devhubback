@@ -392,6 +392,123 @@ def list_plans():
     ]
     return jsonify({"plans": plans})
 
+# ============ COMPARTILHAR ANÁLISE POR EMAIL (B2B/ADMIN) ==========
+@app.route('/api/share-analysis', methods=['POST'])
+def share_analysis():
+    """Compartilha análise por email (apenas ADMIN e planos Business)."""
+    try:
+        data = request.get_json(silent=True) or {}
+        email = str(data.get('email') or '').strip()
+        analysis_id = str(data.get('analysis_id') or '').strip()
+        analysis_type = str(data.get('type', 'backtest')).strip()  # backtest | diary
+        
+        if not email:
+            return jsonify({"error": "Email obrigatório"}), 400
+        
+        # TODO: Validar plano do usuário (ADMIN ou BUSINESS)
+        # user_plan = get_user_plan_from_auth_header()
+        # if user_plan not in ['ADMIN', 'BUSINESS']:
+        #     return jsonify({"error": "Funcionalidade disponível apenas para planos Business"}), 403
+        
+        # Gerar link único para visualização (temporário - mock)
+        share_link = f"https://devhubtrader.com.br/shared/{analysis_type}/{analysis_id}"
+        
+        # TODO: Integrar com SMTP/SendGrid/AWS SES
+        # Por agora, retorna sucesso simulado
+        print(f"[SHARE] Enviando análise {analysis_type}#{analysis_id} para {email}")
+        print(f"[SHARE] Link: {share_link}")
+        
+        # Simular envio de email
+        email_body = f"""
+        Olá!
+        
+        Uma análise foi compartilhada com você:
+        Tipo: {analysis_type.upper()}
+        
+        Acesse através do link: {share_link}
+        
+        Atenciosamente,
+        DevHub Trader
+        """
+        
+        return jsonify({
+            "message": "Análise compartilhada com sucesso (simulado - integre SMTP)",
+            "email": email,
+            "share_link": share_link,
+            "preview": email_body
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ DIÁRIO QUÂNTICO: ACEITAR COMISSÕES CUSTOMIZADAS ==========
+@app.route('/api/diary/calculate', methods=['POST'])
+def diary_calculate_with_commissions():
+    """Calcula métricas do diário quântico considerando comissões customizadas."""
+    try:
+        data = request.get_json(silent=True) or {}
+        trades = data.get('trades', [])
+        
+        # Comissões customizadas (opcional)
+        custom_commissions = data.get('commissions', {})
+        # Formato: { "symbol": { "corretagem": 2.50, "emolumentos": 0.03 } }
+        
+        if not trades:
+            return jsonify({"error": "Lista de trades vazia"}), 400
+        
+        # Converter para DataFrame
+        df = pd.DataFrame(trades)
+        df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
+        df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
+        
+        # Aplicar comissões customizadas
+        if custom_commissions:
+            def apply_custom_cost(row):
+                symbol = str(row.get('symbol', '')).upper()
+                if symbol in custom_commissions:
+                    cost_data = custom_commissions[symbol]
+                    corretagem = float(cost_data.get('corretagem', 0))
+                    emolumentos_pct = float(cost_data.get('emolumentos', 0))
+                    
+                    # Calcular custo total
+                    valor_operado = abs(float(row.get('entry_price', 0)) * float(row.get('quantity', 1)))
+                    custo = corretagem + (valor_operado * emolumentos_pct / 100)
+                    return row['pnl'] - custo
+                return row['pnl']
+            
+            df['pnl_liquido'] = df.apply(apply_custom_cost, axis=1)
+        else:
+            df['pnl_liquido'] = df['pnl']
+        
+        # Calcular métricas básicas
+        total_trades = len(df)
+        total_pnl = df['pnl_liquido'].sum()
+        winning_trades = len(df[df['pnl_liquido'] > 0])
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        
+        # Estatísticas por dia
+        df['date'] = df['entry_date'].dt.date
+        daily_stats = df.groupby('date').agg({
+            'pnl_liquido': ['sum', 'count']
+        }).reset_index()
+        daily_stats.columns = ['date', 'pnl', 'trades']
+        daily_list = daily_stats.to_dict('records')
+        
+        return jsonify({
+            "summary": {
+                "total_trades": int(total_trades),
+                "total_pnl": float(round(total_pnl, 2)),
+                "win_rate": float(round(win_rate, 2)),
+                "winning_trades": int(winning_trades),
+                "losing_trades": int(total_trades - winning_trades)
+            },
+            "daily": daily_list,
+            "commissions_applied": bool(custom_commissions)
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/test-metrics', methods=['POST'])
 def test_metrics():
     """Endpoint de teste para verificar se a API de métricas está funcionando"""
