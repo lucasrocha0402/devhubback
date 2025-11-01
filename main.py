@@ -41,6 +41,8 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # Estado em memória (temporário) para simular alteração de plano no ADMIN
 _ADMIN_USER_PLANS = {}
+# Estado em memória para custos personalizados por ativo (temporário)
+_ADMIN_ASSET_COSTS = {}
 
 # Evitar UnicodeEncodeError em consoles Windows (emojis/logs)
 import sys as _sys
@@ -207,6 +209,44 @@ def admin_update_user_plan():
             "user_id": user_id,
             "new_plan": new_plan
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ ADMIN: CUSTOS POR ATIVO (CRUD) ==========
+@app.route('/api/admin/costs', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def admin_asset_costs():
+    """CRUD de custos personalizados por ativo (comissões)."""
+    try:
+        if request.method == 'GET':
+            # Listar todos os custos
+            return jsonify({"costs": _ADMIN_ASSET_COSTS})
+        
+        data = request.get_json(silent=True) or request.form
+        symbol = str(data.get('symbol') or '').strip().upper()
+        
+        if request.method == 'POST' or request.method == 'PUT':
+            # Criar ou atualizar custo
+            if not symbol:
+                return jsonify({"error": "Campo 'symbol' obrigatório"}), 400
+            corretagem = float(data.get('corretagem', 0))
+            emolumentos = float(data.get('emolumentos', 0))
+            _ADMIN_ASSET_COSTS[symbol] = {
+                "symbol": symbol,
+                "corretagem": corretagem,
+                "emolumentos": emolumentos
+            }
+            return jsonify({
+                "message": "Custo cadastrado/atualizado (temporário)",
+                "cost": _ADMIN_ASSET_COSTS[symbol]
+            })
+        
+        if request.method == 'DELETE':
+            # Remover custo
+            if not symbol or symbol not in _ADMIN_ASSET_COSTS:
+                return jsonify({"error": "Símbolo não encontrado"}), 404
+            del _ADMIN_ASSET_COSTS[symbol]
+            return jsonify({"message": f"Custo de {symbol} removido"})
+    
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
