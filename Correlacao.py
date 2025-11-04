@@ -20,9 +20,9 @@ def calcular_correlacao_por_data_e_direcao(arquivos_df_list):
     # Processar cada arquivo
     dados_processados = {}
     
-    for arquivo in enumerate(arquivos_df_list):
-        df = arquivo[1]['df'].copy()
-        nome = arquivo[1]['nome']
+    for arquivo in arquivos_df_list:
+        df = arquivo['df'].copy()
+        nome = arquivo['nome']
         
         # Extrair data (sem horário)
         if 'entry_date' in df.columns:
@@ -259,12 +259,7 @@ def analisar_correlacao_resultado(dados_processados, arquivos_df_list):
             "quando_uma_perde_outra_tambem_perde_pct": round((dias_todas_perderam / total_dias) * 100, 1) if total_dias > 0 else 0,
             "quando_uma_ganha_outra_tambem_ganha_pct": round((dias_todas_ganharam / total_dias) * 100, 1) if total_dias > 0 else 0,
             "dias_com_diversificacao_pct": round((dias_mistos / total_dias) * 100, 1) if total_dias > 0 else 0
-        },
-        "interpretacao": (
-            "Alta correlação" if total_dias > 0 and (dias_todas_ganharam + dias_todas_perderam) / total_dias > 0.7 
-            else "Boa diversificação" if total_dias > 0 and dias_mistos / total_dias > 0.5 
-            else "Correlação moderada"
-        )
+        }
     }
     
     return {

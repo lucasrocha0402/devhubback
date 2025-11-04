@@ -46,16 +46,28 @@ _ADMIN_ASSET_COSTS = {}
 # Estado em memória para eventos especiais (temporário)
 _ADMIN_EVENTS = {}
 # Estado em memória para limites por plano (temporário)
+# NOVOS NOMES: Free Forever, Quant Starter, Quant Pro, Quant Master
 _ADMIN_PLAN_LIMITS = {
-    'FREE': {'tokens': 100, 'robots': 0, 'portfolios': 0, 'analyses': 5},
-    'STARTER': {'tokens': 500, 'robots': 0, 'portfolios': 0, 'analyses': 20},
-    'PRO1': {'tokens': 2000, 'robots': 3, 'portfolios': 2, 'analyses': 100},
-    'PRO2': {'tokens': 5000, 'robots': 10, 'portfolios': 5, 'analyses': -1},
-    'PRO3': {'tokens': 10000, 'robots': -1, 'portfolios': -1, 'analyses': -1},
-    'BUSINESS': {'tokens': 50000, 'robots': -1, 'portfolios': -1, 'analyses': -1}
+    'FREE_FOREVER': {'tokens': 100, 'portfolios': 0, 'analyses': 5},
+    'QUANT_STARTER': {'tokens': 500, 'portfolios': 0, 'analyses': 20},
+    'QUANT_PRO': {'tokens': 5000, 'portfolios': 5, 'analyses': -1},
+    'QUANT_MASTER': {'tokens': -1, 'portfolios': -1, 'analyses': -1}
+}
+
+# Mapeamento de compatibilidade (antigos para novos)
+_PLAN_MIGRATION = {
+    'FREE': 'FREE_FOREVER',
+    'STARTER': 'QUANT_STARTER',
+    'PRO1': 'QUANT_PRO',
+    'PRO2': 'QUANT_PRO',
+    'PRO3': 'QUANT_MASTER',
+    'BUSINESS': 'QUANT_MASTER'
 }
 # Estado em memória para uso de tokens por usuário (temporário)
-_USER_TOKEN_USAGE = {}  # { user_id: { tokens_used, robots_created, portfolios_created, analyses_run } }
+_USER_TOKEN_USAGE = {}
+
+# Estado em memória para usuários cadastrados (temporário - substituir por DB)
+_REGISTERED_USERS = {}  # { user_id: { tokens_used, robots_created, portfolios_created, analyses_run } }
 
 # Evitar UnicodeEncodeError em consoles Windows (emojis/logs)
 import sys as _sys
@@ -349,49 +361,39 @@ def admin_plan_limits():
 # ============ PLANOS: LISTAR DISPONÍVEIS ==========
 @app.route('/api/plans', methods=['GET'])
 def list_plans():
-    """Lista todos os planos disponíveis com features e limites."""
+    """Lista todos os planos disponíveis com features e limites. NOVOS NOMES!"""
     plans = [
         {
-            "id": "FREE",
-            "name": "Free",
+            "id": "FREE_FOREVER",
+            "name": "Free Forever",
             "price": 0,
             "features": ["Diário Quântico (limitado)", "5 análises/mês", "100 tokens"],
-            "limits": _ADMIN_PLAN_LIMITS.get('FREE', {})
+            "limits": _ADMIN_PLAN_LIMITS.get('FREE_FOREVER', {}),
+            "recommended": False
         },
         {
-            "id": "STARTER",
-            "name": "Starter",
+            "id": "QUANT_STARTER",
+            "name": "Quant Starter",
             "price": 29.90,
-            "features": ["Diário Quântico completo", "20 análises/mês", "500 tokens"],
-            "limits": _ADMIN_PLAN_LIMITS.get('STARTER', {})
+            "features": ["Diário Quântico completo", "20 análises/mês", "500 tokens", "Portfolio Manager"],
+            "limits": _ADMIN_PLAN_LIMITS.get('QUANT_STARTER', {}),
+            "recommended": False
         },
         {
-            "id": "PRO1",
-            "name": "Pro 1",
+            "id": "QUANT_PRO",
+            "name": "Quant Pro",
             "price": 99.90,
-            "features": ["Backtest Analysis", "Portfolio Manager", "3 robôs", "2 portfolios", "100 análises/mês"],
-            "limits": _ADMIN_PLAN_LIMITS.get('PRO1', {})
+            "features": ["Backtest Analysis", "Portfolio Manager", "5 portfolios", "Análises ilimitadas", "5.000 tokens/mês"],
+            "limits": _ADMIN_PLAN_LIMITS.get('QUANT_PRO', {}),
+            "recommended": True
         },
         {
-            "id": "PRO2",
-            "name": "Pro 2",
-            "price": 199.90,
-            "features": ["Tudo do Pro 1", "10 robôs", "5 portfolios", "Análises ilimitadas"],
-            "limits": _ADMIN_PLAN_LIMITS.get('PRO2', {})
-        },
-        {
-            "id": "PRO3",
-            "name": "Pro 3",
-            "price": 399.90,
-            "features": ["Tudo ilimitado", "Suporte prioritário"],
-            "limits": _ADMIN_PLAN_LIMITS.get('PRO3', {})
-        },
-        {
-            "id": "BUSINESS",
-            "name": "Business",
-            "price": 999.90,
-            "features": ["Tudo ilimitado", "Compartilhamento por email", "API dedicada", "Suporte VIP"],
-            "limits": _ADMIN_PLAN_LIMITS.get('BUSINESS', {})
+            "id": "QUANT_MASTER",
+            "name": "Quant Master",
+            "price": 299.90,
+            "features": ["Tudo ilimitado", "Compartilhamento por email", "API dedicada", "Suporte prioritário"],
+            "limits": _ADMIN_PLAN_LIMITS.get('QUANT_MASTER', {}),
+            "recommended": False
         }
     ]
     return jsonify({"plans": plans})
@@ -517,8 +519,11 @@ def diary_calculate_with_commissions():
 @app.route('/api/calendar-results', methods=['POST'])
 def calendar_results():
     """
-    Calendário de Resultados com granularidade diária, semanal e mensal.
-    Olhar estratégico similar ao diário quântico.
+    📅 CALENDÁRIO DE RESULTADOS MELHORADO
+    - Visualização por granularidade (diária, semanal, mensal, anual)
+    - Integração com eventos especiais
+    - Métricas completas: PnL, Win Rate, Profit Factor, Payoff, Drawdown
+    - Destaque de melhor/pior período
     """
     try:
         # Carregar arquivo
@@ -542,7 +547,8 @@ def calendar_results():
         if df.empty:
             return jsonify({"error": "DataFrame vazio"}), 400
         
-        granularity = request.form.get('granularity', 'daily')  # daily | weekly | monthly
+        granularity = request.form.get('granularity', 'daily')  # daily | weekly | monthly | yearly
+        show_events = request.form.get('show_events', 'true').lower() == 'true'  # NOVO: mostrar eventos
         
         # Normalizar datas
         if 'entry_date' in df.columns:
@@ -558,52 +564,124 @@ def calendar_results():
         df_valid['peak'] = df_valid['saldo_cumulativo'].cummax()
         df_valid['drawdown'] = df_valid['saldo_cumulativo'] - df_valid['peak']
         
+        # 📅 CARREGAR EVENTOS ESPECIAIS (se solicitado)
+        eventos_por_data = {}
+        if show_events and _ADMIN_EVENTS:
+            for event_id, event in _ADMIN_EVENTS.items():
+                event_date = event.get('date', '')
+                if event_date:
+                    try:
+                        date_obj = pd.to_datetime(event_date).date()
+                        if date_obj not in eventos_por_data:
+                            eventos_por_data[date_obj] = []
+                        eventos_por_data[date_obj].append({
+                            'id': event_id,
+                            'name': event.get('name', ''),
+                            'description': event.get('description', ''),
+                            'type': event.get('type', 'other')
+                        })
+                    except:
+                        pass
+        
         results = []
         
         if granularity == 'daily':
             # Agrupar por data
             df_valid['date'] = df_valid['entry_date'].dt.date
+            
+            # Agrupar para métricas completas
             grouped = df_valid.groupby('date').agg({
-                'pnl': ['sum', 'count', lambda x: (x > 0).sum()],
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum(), lambda x: (x < 0).sum(), 'mean', 'max', 'min'],
                 'saldo_cumulativo': 'last',
                 'peak': 'last',
                 'drawdown': 'min'
             })
-            grouped.columns = ['pnl_total', 'trades', 'wins', 'saldo_final', 'peak_final', 'drawdown_min']
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'losses', 'avg_trade', 'best_trade', 'worst_trade', 
+                              'saldo_final', 'peak_final', 'drawdown_min']
             grouped = grouped.reset_index()
             
             for _, row in grouped.iterrows():
-                win_rate = (row['wins'] / row['trades'] * 100) if row['trades'] > 0 else 0
+                trades_total = int(row['trades'])
+                wins = int(row['wins'])
+                losses = int(row['losses'])
+                
+                # Calcular métricas completas
+                win_rate = (wins / trades_total * 100) if trades_total > 0 else 0
+                
+                # Calcular profit factor e payoff do dia
+                day_df = df_valid[df_valid['date'] == row['date']]
+                gross_profit = day_df[day_df['pnl'] > 0]['pnl'].sum() if wins > 0 else 0
+                gross_loss = abs(day_df[day_df['pnl'] < 0]['pnl'].sum()) if losses > 0 else 0
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0
+                
+                avg_win = day_df[day_df['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
+                avg_loss = abs(day_df[day_df['pnl'] < 0]['pnl'].mean()) if losses > 0 else 0
+                payoff = (avg_win / avg_loss) if avg_loss > 0 else 0
+                
+                # Verificar se há eventos neste dia
+                eventos_dia = eventos_por_data.get(row['date'], [])
+                
                 results.append({
                     'period': row['date'].isoformat(),
                     'label': row['date'].strftime('%d/%m/%Y'),
-                    'trades': int(row['trades']),
+                    'trades': trades_total,
+                    'winning_trades': wins,
+                    'losing_trades': losses,
                     'pnl_total': float(round(row['pnl_total'], 2)),
                     'win_rate': float(round(win_rate, 2)),
+                    'profit_factor': float(round(profit_factor, 2)),
+                    'payoff': float(round(payoff, 2)),
+                    'avg_trade': float(round(row['avg_trade'], 2)),
+                    'best_trade': float(round(row['best_trade'], 2)),
+                    'worst_trade': float(round(row['worst_trade'], 2)),
                     'saldo_final': float(round(row['saldo_final'], 2)),
-                    'drawdown': float(round(row['drawdown_min'], 2))
+                    'drawdown': float(round(row['drawdown_min'], 2)),
+                    'has_events': len(eventos_dia) > 0,
+                    'events': eventos_dia
                 })
         
         elif granularity == 'weekly':
             # Semana do mês (1-5)
             df_valid['week_of_month'] = ((df_valid['entry_date'].dt.day - 1) // 7) + 1
             grouped = df_valid.groupby('week_of_month').agg({
-                'pnl': ['sum', 'count', lambda x: (x > 0).sum()],
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum(), lambda x: (x < 0).sum(), 'mean', 'max', 'min'],
                 'saldo_cumulativo': 'last',
                 'peak': 'last',
                 'drawdown': 'min'
             })
-            grouped.columns = ['pnl_total', 'trades', 'wins', 'saldo_final', 'peak_final', 'drawdown_min']
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'losses', 'avg_trade', 'best_trade', 'worst_trade', 
+                              'saldo_final', 'peak_final', 'drawdown_min']
             grouped = grouped.reset_index()
             
             for _, row in grouped.iterrows():
-                win_rate = (row['wins'] / row['trades'] * 100) if row['trades'] > 0 else 0
+                trades_total = int(row['trades'])
+                wins = int(row['wins'])
+                losses = int(row['losses'])
+                win_rate = (wins / trades_total * 100) if trades_total > 0 else 0
+                
+                # Calcular profit factor e payoff
+                week_df = df_valid[df_valid['week_of_month'] == row['week_of_month']]
+                gross_profit = week_df[week_df['pnl'] > 0]['pnl'].sum() if wins > 0 else 0
+                gross_loss = abs(week_df[week_df['pnl'] < 0]['pnl'].sum()) if losses > 0 else 0
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0
+                
+                avg_win = week_df[week_df['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
+                avg_loss = abs(week_df[week_df['pnl'] < 0]['pnl'].mean()) if losses > 0 else 0
+                payoff = (avg_win / avg_loss) if avg_loss > 0 else 0
+                
                 results.append({
                     'period': f"semana_{int(row['week_of_month'])}",
                     'label': f"Semana {int(row['week_of_month'])}",
-                    'trades': int(row['trades']),
+                    'trades': trades_total,
+                    'winning_trades': wins,
+                    'losing_trades': losses,
                     'pnl_total': float(round(row['pnl_total'], 2)),
                     'win_rate': float(round(win_rate, 2)),
+                    'profit_factor': float(round(profit_factor, 2)),
+                    'payoff': float(round(payoff, 2)),
+                    'avg_trade': float(round(row['avg_trade'], 2)),
+                    'best_trade': float(round(row['best_trade'], 2)),
+                    'worst_trade': float(round(row['worst_trade'], 2)),
                     'saldo_final': float(round(row['saldo_final'], 2)),
                     'drawdown': float(round(row['drawdown_min'], 2))
                 })
@@ -613,48 +691,134 @@ def calendar_results():
             import calendar
             df_valid['month_num'] = df_valid['entry_date'].dt.month
             grouped = df_valid.groupby('month_num').agg({
-                'pnl': ['sum', 'count', lambda x: (x > 0).sum()],
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum(), lambda x: (x < 0).sum(), 'mean', 'max', 'min'],
                 'saldo_cumulativo': 'last',
                 'peak': 'last',
                 'drawdown': 'min'
             })
-            grouped.columns = ['pnl_total', 'trades', 'wins', 'saldo_final', 'peak_final', 'drawdown_min']
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'losses', 'avg_trade', 'best_trade', 'worst_trade', 
+                              'saldo_final', 'peak_final', 'drawdown_min']
             grouped = grouped.reset_index()
             
             for _, row in grouped.iterrows():
                 month_name = calendar.month_name[int(row['month_num'])]
-                win_rate = (row['wins'] / row['trades'] * 100) if row['trades'] > 0 else 0
+                trades_total = int(row['trades'])
+                wins = int(row['wins'])
+                losses = int(row['losses'])
+                win_rate = (wins / trades_total * 100) if trades_total > 0 else 0
+                
+                # Calcular profit factor e payoff
+                month_df = df_valid[df_valid['month_num'] == row['month_num']]
+                gross_profit = month_df[month_df['pnl'] > 0]['pnl'].sum() if wins > 0 else 0
+                gross_loss = abs(month_df[month_df['pnl'] < 0]['pnl'].sum()) if losses > 0 else 0
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0
+                
+                avg_win = month_df[month_df['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
+                avg_loss = abs(month_df[month_df['pnl'] < 0]['pnl'].mean()) if losses > 0 else 0
+                payoff = (avg_win / avg_loss) if avg_loss > 0 else 0
+                
                 results.append({
                     'period': month_name.lower(),
                     'label': month_name,
-                    'trades': int(row['trades']),
+                    'trades': trades_total,
+                    'winning_trades': wins,
+                    'losing_trades': losses,
                     'pnl_total': float(round(row['pnl_total'], 2)),
                     'win_rate': float(round(win_rate, 2)),
+                    'profit_factor': float(round(profit_factor, 2)),
+                    'payoff': float(round(payoff, 2)),
+                    'avg_trade': float(round(row['avg_trade'], 2)),
+                    'best_trade': float(round(row['best_trade'], 2)),
+                    'worst_trade': float(round(row['worst_trade'], 2)),
                     'saldo_final': float(round(row['saldo_final'], 2)),
                     'drawdown': float(round(row['drawdown_min'], 2))
                 })
         
-        # Calcular resumo estratégico
+        elif granularity == 'yearly':
+            # Ano (agrupa por ano civil)
+            df_valid['year'] = df_valid['entry_date'].dt.year
+            grouped = df_valid.groupby('year').agg({
+                'pnl': ['sum', 'count', lambda x: (x > 0).sum(), lambda x: (x < 0).sum(), 'mean', 'max', 'min'],
+                'saldo_cumulativo': 'last',
+                'peak': 'last',
+                'drawdown': 'min'
+            })
+            grouped.columns = ['pnl_total', 'trades', 'wins', 'losses', 'avg_trade', 'best_trade', 'worst_trade', 
+                              'saldo_final', 'peak_final', 'drawdown_min']
+            grouped = grouped.reset_index()
+            
+            for _, row in grouped.iterrows():
+                year = int(row['year'])
+                trades_total = int(row['trades'])
+                wins = int(row['wins'])
+                losses = int(row['losses'])
+                win_rate = (wins / trades_total * 100) if trades_total > 0 else 0
+                
+                # Calcular profit factor e payoff
+                year_df = df_valid[df_valid['year'] == row['year']]
+                gross_profit = year_df[year_df['pnl'] > 0]['pnl'].sum() if wins > 0 else 0
+                gross_loss = abs(year_df[year_df['pnl'] < 0]['pnl'].sum()) if losses > 0 else 0
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0
+                
+                avg_win = year_df[year_df['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
+                avg_loss = abs(year_df[year_df['pnl'] < 0]['pnl'].mean()) if losses > 0 else 0
+                payoff = (avg_win / avg_loss) if avg_loss > 0 else 0
+                
+                results.append({
+                    'period': f"year_{year}",
+                    'label': str(year),
+                    'trades': trades_total,
+                    'winning_trades': wins,
+                    'losing_trades': losses,
+                    'pnl_total': float(round(row['pnl_total'], 2)),
+                    'win_rate': float(round(win_rate, 2)),
+                    'profit_factor': float(round(profit_factor, 2)),
+                    'payoff': float(round(payoff, 2)),
+                    'avg_trade': float(round(row['avg_trade'], 2)),
+                    'best_trade': float(round(row['best_trade'], 2)),
+                    'worst_trade': float(round(row['worst_trade'], 2)),
+                    'saldo_final': float(round(row['saldo_final'], 2)),
+                    'drawdown': float(round(row['drawdown_min'], 2))
+                })
+        
+        # 📊 CALCULAR RESUMO ESTRATÉGICO COMPLETO
         if results:
             best_period = max(results, key=lambda x: x['pnl_total'])
             worst_period = min(results, key=lambda x: x['pnl_total'])
             total_pnl = sum(r['pnl_total'] for r in results)
+            total_trades = sum(r['trades'] for r in results)
             avg_win_rate = sum(r['win_rate'] for r in results) / len(results) if results else 0
+            avg_profit_factor = sum(r['profit_factor'] for r in results) / len(results) if results else 0
+            avg_payoff = sum(r['payoff'] for r in results) / len(results) if results else 0
+            
+            # Contar períodos positivos vs negativos
+            periods_positive = sum(1 for r in results if r['pnl_total'] > 0)
+            periods_negative = sum(1 for r in results if r['pnl_total'] < 0)
+            consistency = (periods_positive / len(results) * 100) if len(results) > 0 else 0
         else:
             best_period = worst_period = None
-            total_pnl = 0
-            avg_win_rate = 0
+            total_pnl = total_trades = 0
+            avg_win_rate = avg_profit_factor = avg_payoff = consistency = 0
+            periods_positive = periods_negative = 0
         
         return jsonify({
             'granularity': granularity,
             'summary': {
                 'total_periods': len(results),
+                'total_trades': int(total_trades),
                 'total_pnl': float(round(total_pnl, 2)),
                 'avg_win_rate': float(round(avg_win_rate, 2)),
+                'avg_profit_factor': float(round(avg_profit_factor, 2)),
+                'avg_payoff': float(round(avg_payoff, 2)),
+                'periods_positive': int(periods_positive),
+                'periods_negative': int(periods_negative),
+                'consistency': float(round(consistency, 2)),
                 'best_period': best_period,
-                'worst_period': worst_period
+                'worst_period': worst_period,
+                'total_events': len(eventos_por_data) if show_events else 0
             },
-            'results': results
+            'results': results,
+            'show_events': show_events
         })
     
     except Exception as e:
@@ -810,10 +974,15 @@ def get_user_usage():
     try:
         # TODO: Obter user_id do token de autenticação
         user_id = request.args.get('user_id', 'demo_user')
-        user_plan = _ADMIN_USER_PLANS.get(user_id, 'FREE')
+        user_plan = _ADMIN_USER_PLANS.get(user_id, 'FREE_FOREVER')
+        
+        # Migrar planos antigos para novos (compatibilidade)
+        if user_plan in _PLAN_MIGRATION:
+            user_plan = _PLAN_MIGRATION[user_plan]
+            _ADMIN_USER_PLANS[user_id] = user_plan  # Atualizar
         
         # Limites do plano
-        plan_limits = _ADMIN_PLAN_LIMITS.get(user_plan, _ADMIN_PLAN_LIMITS['FREE'])
+        plan_limits = _ADMIN_PLAN_LIMITS.get(user_plan, _ADMIN_PLAN_LIMITS['FREE_FOREVER'])
         
         # Uso atual
         usage = _USER_TOKEN_USAGE.get(user_id, {
@@ -823,7 +992,7 @@ def get_user_usage():
             'analyses_run': 0
         })
         
-        # Calcular disponibilidade
+        # Calcular disponibilidade (REMOVIDO: robots)
         def calc_available(used, limit):
             if limit == -1:  # ilimitado
                 return -1
@@ -836,7 +1005,6 @@ def get_user_usage():
             "usage": usage,
             "available": {
                 "tokens": calc_available(usage['tokens_used'], plan_limits['tokens']),
-                "robots": calc_available(usage['robots_created'], plan_limits['robots']),
                 "portfolios": calc_available(usage['portfolios_created'], plan_limits['portfolios']),
                 "analyses": calc_available(usage['analyses_run'], plan_limits['analyses'])
             }
@@ -868,10 +1036,9 @@ def consume_tokens():
         
         usage = _USER_TOKEN_USAGE[user_id]
         
-        # Mapear resource para chave de uso
+        # Mapear resource para chave de uso (REMOVIDO: robots)
         resource_map = {
             'tokens': ('tokens_used', 'tokens'),
-            'robots': ('robots_created', 'robots'),
             'portfolios': ('portfolios_created', 'portfolios'),
             'analyses': ('analyses_run', 'analyses')
         }
@@ -883,15 +1050,18 @@ def consume_tokens():
         current_usage = usage[usage_key]
         limit = plan_limits[limit_key]
         
-        # Validar se há limite disponível
-        if limit != -1 and (current_usage + amount) > limit:
-            return jsonify({
-                "error": f"Limite de {resource} excedido",
-                "current": current_usage,
-                "limit": limit,
-                "requested": amount,
-                "available": max(0, limit - current_usage)
-            }), 403
+        # ⚠️ LIMITE IMPORTANTE: Não permitir consumo que deixe negativo
+        if limit != -1:
+            available = max(0, limit - current_usage)
+            if amount > available:
+                return jsonify({
+                    "error": f"Limite de {resource} excedido",
+                    "current": current_usage,
+                    "limit": limit,
+                    "requested": amount,
+                    "available": available,
+                    "message": "Você não pode consumir mais do que o limite disponível. Faça upgrade do plano."
+                }), 403
         
         # Consumir recurso
         usage[usage_key] += amount
@@ -1357,8 +1527,13 @@ def processar_trades(df: pd.DataFrame, arquivo_para_indices: Dict[int, str] = No
 
 def calcular_estatisticas_temporais(df: pd.DataFrame) -> Dict[str, Any]:
     """Calcula estatísticas temporais com serialização JSON correta"""
+    # CORRIGIDO: Retornar estrutura válida mesmo com df vazio
     if df.empty or 'entry_date' not in df.columns:
-        return {}
+        return {
+            "by_day_of_week": {},
+            "by_month": {},
+            "by_hour": {}
+        }
     
     df_valid = df.dropna(subset=['entry_date', 'pnl'])
     
@@ -1437,15 +1612,35 @@ def make_json_serializable(obj):
 # Versão atualizada das outras funções de estatísticas para garantir serialização
 def calcular_estatisticas_gerais(df: pd.DataFrame) -> Dict[str, Any]:
     """Calcula estatísticas gerais das trades com serialização JSON correta"""
+    # CORRIGIDO: Retornar estrutura válida mesmo com df vazio
+    estrutura_vazia = {
+        "total_trades": 0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "break_even_trades": 0,
+        "win_rate": 0.0,
+        "total_pnl": 0.0,
+        "avg_win": 0.0,
+        "avg_loss": 0.0,
+        "avg_trade": 0.0,
+        "best_trade": 0.0,
+        "worst_trade": 0.0,
+        "profit_factor": 0.0,
+        "expectancy": 0.0,
+        "gross_profit": 0.0,
+        "gross_loss": 0.0,
+        "max_drawdown": 0.0
+    }
+    
     if df.empty:
-        return {}
+        return estrutura_vazia
     
     # Filtrar trades válidas
     df_valid = df.dropna(subset=['pnl'])
     
     total_trades = len(df_valid)
     if total_trades == 0:
-        return {}
+        return estrutura_vazia
     
     # Resultados básicos
     total_pnl = df_valid['pnl'].sum()
@@ -1527,8 +1722,16 @@ def calcular_estatisticas_por_ativo(df: pd.DataFrame) -> Dict[str, Any]:
 
 def calcular_custos_operacionais(df: pd.DataFrame, taxa_corretagem: float = 0.5, taxa_emolumentos: float = 0.03) -> Dict[str, Any]:
     """Calcula custos operacionais estimados"""
+    # CORRIGIDO: Retornar estrutura válida mesmo com df vazio
     if df.empty:
-        return {}
+        return {
+            "total_trades": 0,
+            "valor_total_operado": 0.0,
+            "custo_corretagem": 0.0,
+            "custo_emolumentos": 0.0,
+            "custo_total": 0.0,
+            "custo_por_trade": 0.0
+        }
     
     df_valid = df.dropna(subset=['entry_price', 'exit_price'])
     total_trades = len(df_valid)
@@ -1778,13 +1981,18 @@ def calcular_metricas_principais(df: pd.DataFrame, taxa_juros_mensal: float = 0.
         "ganhos_perdas": {
             "ganho_medio_diario": round(daily_avg_win, 2),
             "perda_media_diaria": round(daily_avg_loss, 2),
-            "payoff_diario": round(daily_avg_win / daily_avg_loss if daily_avg_loss != 0 else 0, 2),
+            "payoff_diario": round(payoff_ratio, 2),  # CORRIGIDO: usar payoff_ratio das operações (avg_win/avg_loss)
             "ganho_maximo_diario": round(daily_max_win, 2),
-            "perda_maxima_diaria": round(abs(daily_max_loss), 2)  # Valor absoluto para compatibilidade
+            "perda_maxima_diaria": round(abs(daily_max_loss), 2),  # Valor absoluto para compatibilidade
+            "ganho_medio_operacao": round(avg_win, 2),  # NOVO: ganho médio por operação
+            "perda_media_operacao": round(avg_loss, 2),  # NOVO: perda média por operação
+            "pior_operacao": round(df_valid['pnl'].min(), 2),  # NOVO: pior operação individual
+            "melhor_operacao": round(df_valid['pnl'].max(), 2)  # NOVO: melhor operação individual
         },
         "estatisticas_operacao": {
             "media_operacoes_dia": round(avg_trades_per_day, 1),
-            "taxa_acerto_diaria": round(daily_win_rate, 2),
+            "taxa_acerto_operacoes": round(payoff_ratio, 2),  # Payoff das operações
+            "taxa_acerto_diaria": round(daily_win_rate, 2),  # Taxa de acerto de DIAS
             "dias_vencedores_perdedores": f"{winning_days} / {losing_days}",
             "dias_perdedores_consecutivos": consecutive_losses,
             "dias_vencedores_consecutivos": consecutive_wins
@@ -1891,12 +2099,13 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
     Calcula TODOS os índices de disciplina em uma função única:
     - Disciplina Stop (por operação)
     - Disciplina Perda/Dia (por dia)
-    - Métrica de Fúria Diária (baseada em múltiplo da perda média)
+    - Análise Emocional (baseada em desvio padrão e volatilidade)
+    - Risco de Ruína (Risk of Ruin - probabilidade de perder capital)
     
     Args:
         df: DataFrame com as operações
         fator_disciplina: Fator para calcular meta máxima (padrão 20% = 0.2)
-        multiplicador_furia: Multiplicador para definir "dia de fúria" (padrão 2.0 = 2x a perda média)
+        multiplicador_furia: Mantido para compatibilidade (não usado, substituído por desvio padrão)
     
     Returns:
         Dict com todas as métricas de disciplina (JSON serializable)
@@ -2001,71 +2210,133 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
     # Separar dias com perda
     dias_com_perda = resultado_diario[resultado_diario['PnL_Dia'] < 0].copy()
     
-    # ===== NOVA MÉTRICA: FÚRIA DIÁRIA =====
-    if dias_com_perda.empty:
-        furia_diaria = {
-            "disponivel": False,
-            "motivo": "Não há dias com perda para calcular fúria",
-            "dias_com_perda": 0,
-            "perda_media_diaria": 0.0,
-            "limite_furia": 0.0,
-            "dias_furia": 0,
-            "total_dias_operados": int(len(resultado_diario)),
-            "percentual_dias_furia": 0.0,
-            "frequencia_furia": 0.0,
-            "detalhes_furia": []
-        }
-    else:
-        # Calcular perda média diária
-        perda_media_diaria = float(abs(dias_com_perda['PnL_Dia'].mean()))
-        
-        # Definir limite de fúria (multiplicador da perda média)
-        limite_furia = perda_media_diaria * multiplicador_furia
-        
-        # Identificar dias de fúria (perdas maiores que o limite)
-        dias_furia = dias_com_perda[abs(dias_com_perda['PnL_Dia']) > limite_furia]
-        qtd_dias_furia = int(len(dias_furia))
-        
-        # Calcular métricas
-        total_dias_operados = int(len(resultado_diario))  # Total de dias que teve operações
-        percentual_dias_furia = (qtd_dias_furia / total_dias_operados) * 100  # % em relação aos dias operados
-        frequencia_furia = (qtd_dias_furia / len(dias_com_perda)) * 100  # Em relação aos dias com perda
-        
-        furia_diaria = {
-            "disponivel": True,
-            "dias_com_perda": int(len(dias_com_perda)),
-            "perda_media_diaria": round(perda_media_diaria, 2),
-            "limite_furia": round(limite_furia, 2),
-            "multiplicador_usado": multiplicador_furia,
-            "dias_furia": qtd_dias_furia,
-            "total_dias_operados": total_dias_operados,
-            "percentual_dias_furia": round(percentual_dias_furia, 2),
-            "frequencia_furia_vs_dias_perda": round(frequencia_furia, 2),
-            "detalhes_furia": [
-                {
-                    "data": row['Data'].strftime('%d/%m/%Y'),
-                    "pnl_dia": round(float(row['PnL_Dia']), 2),
-                    "perda_absoluta": round(abs(float(row['PnL_Dia'])), 2),
-                    "trades_dia": int(row['Trades_Dia']),
-                    "excesso_limite": round(abs(float(row['PnL_Dia'])) - limite_furia, 2),
-                    "multiplo_media": round(abs(float(row['PnL_Dia'])) / perda_media_diaria, 2),
-                    "pior_trade": round(float(row['Pior_Trade_Dia']), 2),
-                    "intensidade": "extrema" if abs(float(row['PnL_Dia'])) > limite_furia * 1.5 else "alta"
-                }
-                for _, row in dias_furia.iterrows()
-            ] if qtd_dias_furia > 0 else [],
-            "estatisticas_intensidade": {
-                "furia_alta": int(len(dias_furia[abs(dias_furia['PnL_Dia']) <= limite_furia * 1.5])),
-                "furia_extrema": int(len(dias_furia[abs(dias_furia['PnL_Dia']) > limite_furia * 1.5])),
-                "pior_dia_furia": round(float(dias_furia['PnL_Dia'].min()), 2) if qtd_dias_furia > 0 else 0.0,
-                "media_perda_furia": round(float(dias_furia['PnL_Dia'].mean()), 2) if qtd_dias_furia > 0 else 0.0
-            }
-        }
+    # ===== NOVA MÉTRICA: ANÁLISE EMOCIONAL COM DESVIO PADRÃO =====
+    # Calcular volatilidade e consistência dos resultados diários
+    pnl_diario = resultado_diario['PnL_Dia'].values
     
-    # ===== PROBABILIDADE DE FÚRIA (SEQUENCIAL) =====
+    # Estatísticas básicas
+    desvio_padrao_diario = float(np.std(pnl_diario, ddof=1)) if len(pnl_diario) > 1 else 0.0
+    media_pnl_diario = float(np.mean(pnl_diario))
+    
+    # Coeficiente de variação (CV = desvio / média) - mede consistência
+    # Quanto menor, mais consistente
+    coeficiente_variacao = abs(desvio_padrao_diario / media_pnl_diario) if media_pnl_diario != 0 else 0.0
+    
+    # Identificar dias com alta volatilidade (> 2 desvios padrão da média)
+    limite_volatilidade_alto = media_pnl_diario - (2 * desvio_padrao_diario)
+    dias_alta_volatilidade = resultado_diario[resultado_diario['PnL_Dia'] < limite_volatilidade_alto]
+    qtd_dias_alta_volatilidade = int(len(dias_alta_volatilidade))
+    
+    # Identificar dias com volatilidade extrema (> 3 desvios padrão)
+    limite_volatilidade_extrema = media_pnl_diario - (3 * desvio_padrao_diario)
+    dias_volatilidade_extrema = resultado_diario[resultado_diario['PnL_Dia'] < limite_volatilidade_extrema]
+    qtd_dias_volatilidade_extrema = int(len(dias_volatilidade_extrema))
+    
+    # Calcular percentuais
+    total_dias_operados = int(len(resultado_diario))
+    percentual_alta_volatilidade = (qtd_dias_alta_volatilidade / total_dias_operados) * 100 if total_dias_operados > 0 else 0.0
+    percentual_volatilidade_extrema = (qtd_dias_volatilidade_extrema / total_dias_operados) * 100 if total_dias_operados > 0 else 0.0
+    
+    # Classificar risco emocional baseado no coeficiente de variação
+    if coeficiente_variacao < 0.5:
+        classificacao_emocional = "baixo"
+        consistencia = "alta"
+    elif coeficiente_variacao < 1.0:
+        classificacao_emocional = "medio"
+        consistencia = "media"
+    else:
+        classificacao_emocional = "alto"
+        consistencia = "baixa"
+    
+    analise_emocional = {
+        "disponivel": True,
+        "desvio_padrao_diario": round(desvio_padrao_diario, 2),
+        "media_pnl_diario": round(media_pnl_diario, 2),
+        "coeficiente_variacao": round(coeficiente_variacao, 2),
+        "classificacao_risco_emocional": classificacao_emocional,
+        "nivel_consistencia": consistencia,
+        "total_dias_operados": total_dias_operados,
+        "limite_2_desvios": round(limite_volatilidade_alto, 2),
+        "limite_3_desvios": round(limite_volatilidade_extrema, 2),
+        "dias_alta_volatilidade": qtd_dias_alta_volatilidade,
+        "dias_volatilidade_extrema": qtd_dias_volatilidade_extrema,
+        "percentual_alta_volatilidade": round(percentual_alta_volatilidade, 2),
+        "percentual_volatilidade_extrema": round(percentual_volatilidade_extrema, 2),
+        "detalhes_dias_volateis": [
+            {
+                "data": row['Data'].strftime('%d/%m/%Y'),
+                "pnl_dia": round(float(row['PnL_Dia']), 2),
+                "trades_dia": int(row['Trades_Dia']),
+                "pior_trade": round(float(row['Pior_Trade_Dia']), 2),
+                "desvios_da_media": round((float(row['PnL_Dia']) - media_pnl_diario) / desvio_padrao_diario, 2) if desvio_padrao_diario > 0 else 0,
+                "intensidade": "extrema" if row['PnL_Dia'] < limite_volatilidade_extrema else "alta"
+            }
+            for _, row in dias_alta_volatilidade.iterrows()
+        ] if qtd_dias_alta_volatilidade > 0 else [],
+        "estatisticas_volatilidade": {
+            "dias_normais": total_dias_operados - qtd_dias_alta_volatilidade,
+            "dias_alta_volatilidade": qtd_dias_alta_volatilidade,
+            "dias_extrema_volatilidade": qtd_dias_volatilidade_extrema,
+            "pior_dia": round(float(pnl_diario.min()), 2),
+            "melhor_dia": round(float(pnl_diario.max()), 2),
+            "amplitude_total": round(float(pnl_diario.max() - pnl_diario.min()), 2)
+        }
+    }
+    
+    # ===== RISCO DE RUÍNA (RISK OF RUIN) =====
     # Calcular sequências de perdas consecutivas
     df_valid['eh_perda'] = df_valid[resultado_col] < 0
     df_valid = df_valid.sort_values(data_col).reset_index(drop=True)
+    
+    # Calcular métricas necessárias para Risk of Ruin
+    total_trades = len(df_valid)
+    total_wins = int(len(df_valid[df_valid[resultado_col] > 0]))
+    total_losses = int(len(df_valid[df_valid[resultado_col] < 0]))
+    
+    # Win Rate
+    win_rate = (total_wins / total_trades) if total_trades > 0 else 0.0
+    loss_rate = (total_losses / total_trades) if total_trades > 0 else 0.0
+    
+    # Calcular ganho médio e perda média
+    avg_win = float(df_valid[df_valid[resultado_col] > 0][resultado_col].mean()) if total_wins > 0 else 0.0
+    avg_loss = float(abs(df_valid[df_valid[resultado_col] < 0][resultado_col].mean())) if total_losses > 0 else 0.0
+    
+    # Payoff Ratio (Average Win / Average Loss)
+    payoff_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+    
+    # Total PnL para estimar capital inicial
+    total_pnl = float(df_valid[resultado_col].sum())
+    
+    # Estimar capital inicial baseado no PnL total e assumindo risco conservador
+    # Assumimos que o capital inicial deveria ser no mínimo 3x o maior drawdown esperado
+    estimated_capital = max(abs(total_pnl) * 2, abs(avg_loss) * 10, 10000)  # Mínimo de 10k
+    
+    # Calcular Risk of Ruin usando fórmula clássica
+    # RoR = [(1 - W) / (1 + W)]^(Capital / Perda Média)
+    # Onde W = (Win Rate * Payoff Ratio) - Loss Rate
+    
+    if payoff_ratio > 0 and avg_loss > 0:
+        # Expectativa matemática (edge)
+        expectativa = (win_rate * avg_win) - (loss_rate * avg_loss)
+        
+        # Número de unidades de risco (quantas perdas médias cabem no capital)
+        unidades_risco = estimated_capital / avg_loss if avg_loss > 0 else 100
+        
+        # Risk of Ruin para diferentes níveis de drawdown
+        # RoR = ((1 - W) / (1 + W))^U, onde W = edge/avg_loss, U = unidades
+        if expectativa > 0:
+            w_factor = expectativa / avg_loss
+            if w_factor > 0 and w_factor < 1:
+                ror_10_pct = (((1 - w_factor) / (1 + w_factor)) ** (unidades_risco * 0.1)) * 100
+                ror_20_pct = (((1 - w_factor) / (1 + w_factor)) ** (unidades_risco * 0.2)) * 100
+                ror_30_pct = (((1 - w_factor) / (1 + w_factor)) ** (unidades_risco * 0.3)) * 100
+            else:
+                ror_10_pct = ror_20_pct = ror_30_pct = 0.0
+        else:
+            # Expectativa negativa = alto risco de ruína
+            ror_10_pct = ror_20_pct = ror_30_pct = 95.0
+    else:
+        ror_10_pct = ror_20_pct = ror_30_pct = 50.0  # Valor neutro
     
     # Identificar sequências de perdas
     sequencias_perdas = []
@@ -2087,65 +2358,61 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
         maior_sequencia_perdas = max(sequencias_perdas)
         total_sequencias = len(sequencias_perdas)
         media_sequencia_perdas = sum(sequencias_perdas) / len(sequencias_perdas)
-        
-        # Calcular probabilidade de "fúria" (sequência >= 3 perdas)
-        sequencias_furia = [s for s in sequencias_perdas if s >= 3]
-        qtd_episodios_furia = len(sequencias_furia)
-        
-        # Probabilidade = episódios de fúria / total de sequências de perda
-        if total_sequencias > 0:
-            probabilidade_furia = (qtd_episodios_furia / total_sequencias) * 100
-        else:
-            probabilidade_furia = 0.0
-        
-        # Calcular frequência de fúria por total de trades
-        frequencia_furia_trades = (qtd_episodios_furia / total_operacoes) * 100
-        
-        probabilidade_furia_resultado = {
-            "disponivel": True,
-            "total_operacoes": total_operacoes,
-            "total_operacoes_perdedoras": int(len(df_valid[df_valid['eh_perda']])),
-            "total_sequencias_perda": total_sequencias,
-            "maior_sequencia_perdas": maior_sequencia_perdas,
-            "media_sequencia_perdas": round(media_sequencia_perdas, 2),
-            "episodios_furia": qtd_episodios_furia,
-            "probabilidade_furia": round(probabilidade_furia, 2),
-            "frequencia_furia_por_trades": round(frequencia_furia_trades, 2),
-            "detalhes_sequencias": [
-                {
-                    "sequencia_numero": i + 1,
-                    "tamanho_sequencia": seq,
-                    "eh_furia": seq >= 3,
-                    "classificacao": "fúria" if seq >= 3 else "normal" if seq <= 2 else "moderada"
-                }
-                for i, seq in enumerate(sequencias_perdas)
-            ],
-            "estatisticas_sequencias": {
-                "sequencias_1_perda": len([s for s in sequencias_perdas if s == 1]),
-                "sequencias_2_perdas": len([s for s in sequencias_perdas if s == 2]),
-                "sequencias_3_ou_mais": len([s for s in sequencias_perdas if s >= 3]),
-                "sequencias_5_ou_mais": len([s for s in sequencias_perdas if s >= 5])
-            }
-        }
     else:
-        probabilidade_furia_resultado = {
-            "disponivel": True,
-            "total_operacoes": total_operacoes,
-            "total_operacoes_perdedoras": 0,
-            "total_sequencias_perda": 0,
-            "maior_sequencia_perdas": 0,
-            "media_sequencia_perdas": 0.0,
-            "episodios_furia": 0,
-            "probabilidade_furia": 0.0,
-            "frequencia_furia_por_trades": 0.0,
-            "detalhes_sequencias": [],
-            "estatisticas_sequencias": {
-                "sequencias_1_perda": 0,
-                "sequencias_2_perdas": 0,
-                "sequencias_3_ou_mais": 0,
-                "sequencias_5_ou_mais": 0
-            }
+        maior_sequencia_perdas = 0
+        total_sequencias = 0
+        media_sequencia_perdas = 0.0
+    
+    # Classificar risco de ruína
+    ror_medio = (ror_10_pct + ror_20_pct + ror_30_pct) / 3
+    if ror_medio < 5:
+        classificacao_ror = "muito_baixo"
+    elif ror_medio < 15:
+        classificacao_ror = "baixo"
+    elif ror_medio < 30:
+        classificacao_ror = "moderado"
+    elif ror_medio < 50:
+        classificacao_ror = "alto"
+    else:
+        classificacao_ror = "muito_alto"
+    
+    risco_ruina = {
+        "disponivel": True,
+        "metricas_base": {
+            "total_operacoes": total_trades,
+            "total_wins": total_wins,
+            "total_losses": total_losses,
+            "win_rate": round(win_rate * 100, 2),
+            "loss_rate": round(loss_rate * 100, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "payoff_ratio": round(payoff_ratio, 2),
+            "expectativa_matematica": round(expectativa if payoff_ratio > 0 else 0, 2)
+        },
+        "capital_estimado": round(estimated_capital, 2),
+        "unidades_risco": round(unidades_risco, 2),
+        "probabilidade_ruina": {
+            "drawdown_10_pct": round(min(ror_10_pct, 100), 2),
+            "drawdown_20_pct": round(min(ror_20_pct, 100), 2),
+            "drawdown_30_pct": round(min(ror_30_pct, 100), 2),
+            "risco_medio": round(ror_medio, 2)
+        },
+        "classificacao_risco": classificacao_ror,
+        "sequencias_perdas": {
+            "maior_sequencia": maior_sequencia_perdas,
+            "media_sequencia": round(media_sequencia_perdas, 2),
+            "total_sequencias": total_sequencias,
+            "sequencias_1_perda": len([s for s in sequencias_perdas if s == 1]),
+            "sequencias_2_perdas": len([s for s in sequencias_perdas if s == 2]),
+            "sequencias_3_ou_mais": len([s for s in sequencias_perdas if s >= 3]),
+            "sequencias_5_ou_mais": len([s for s in sequencias_perdas if s >= 5])
+        },
+        "recomendacao": {
+            "tamanho_posicao_sugerido": round((estimated_capital * 0.02) / avg_loss if avg_loss > 0 else 1, 2),
+            "capital_minimo_recomendado": round(avg_loss * 30, 2),  # 30x a perda média
+            "alerta": "Alto risco de ruína - reduza tamanho de posição" if ror_medio > 30 else "Risco controlado" if ror_medio < 15 else "Risco moderado - monitore"
         }
+    }
     
     # ===== DISCIPLINA STOP (POR OPERAÇÃO) =====
     operacoes_perdedoras = df_valid[df_valid[resultado_col] < 0].copy()
@@ -2244,14 +2511,15 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
         "disciplina_operacao": disciplina_operacao["indice_disciplina"],
         "disciplina_dia": disciplina_dia["indice_disciplina_diaria"],
         "disciplina_alavancagem": disciplina_alavancagem["indice_disciplina_alavancagem"] if disciplina_alavancagem["disponivel"] else None,
-        "probabilidade_furia_sequencial": probabilidade_furia_resultado["probabilidade_furia"],
-        "percentual_dias_furia": furia_diaria["percentual_dias_furia"] if furia_diaria["disponivel"] else 0.0,
-        "frequencia_furia_diaria": furia_diaria["frequencia_furia_vs_dias_perda"] if furia_diaria["disponivel"] else 0.0,
+        "risco_ruina_medio": risco_ruina["probabilidade_ruina"]["risco_medio"],
+        "classificacao_risco_ruina": risco_ruina["classificacao_risco"],
+        "percentual_alta_volatilidade": analise_emocional["percentual_alta_volatilidade"],
+        "coeficiente_variacao": analise_emocional["coeficiente_variacao"],
         "diferenca_operacao_dia": round(disciplina_operacao["indice_disciplina"] - disciplina_dia["indice_disciplina_diaria"], 2),
         "melhor_disciplina": "operacao" if disciplina_operacao["indice_disciplina"] > disciplina_dia["indice_disciplina_diaria"] else "dia",
         "media_perda_operacao": disciplina_operacao["media_perda"],
         "media_perda_dia": disciplina_dia["media_perda_diaria"],
-        "limite_furia_diaria": furia_diaria["limite_furia"] if furia_diaria["disponivel"] else None
+        "desvio_padrao_diario": analise_emocional["desvio_padrao_diario"]
     }
     
     # Adicionar comparação com alavancagem se disponível
@@ -2268,18 +2536,18 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
         resumo["melhor_disciplina_geral"] = max(disciplinas, key=disciplinas.get)
         resumo["pior_disciplina_geral"] = min(disciplinas, key=disciplinas.get)
     
-    # Adicionar indicadores de risco baseados na fúria
-    resumo["risco_emocional_sequencial"] = "alto" if probabilidade_furia_resultado["probabilidade_furia"] > 50 else "medio" if probabilidade_furia_resultado["probabilidade_furia"] > 25 else "baixo"
-    resumo["risco_emocional_diario"] = "alto" if furia_diaria["percentual_dias_furia"] > 15 else "medio" if furia_diaria["percentual_dias_furia"] > 5 else "baixo"
-    resumo["maior_sequencia_perdas"] = probabilidade_furia_resultado["maior_sequencia_perdas"]
+    # Adicionar indicadores de risco baseados nas novas métricas
+    resumo["risco_emocional_volatilidade"] = analise_emocional["classificacao_risco_emocional"]
+    resumo["nivel_consistencia"] = analise_emocional["nivel_consistencia"]
+    resumo["maior_sequencia_perdas"] = risco_ruina["sequencias_perdas"]["maior_sequencia"]
     
     # ===== RESULTADO FINAL =====
     return {
         "disciplina_operacao": disciplina_operacao,
         "disciplina_dia": disciplina_dia,
         "disciplina_alavancagem": disciplina_alavancagem,
-        "probabilidade_furia_sequencial": probabilidade_furia_resultado,
-        "furia_diaria": furia_diaria,
+        "risco_ruina": risco_ruina,
+        "analise_emocional": analise_emocional,
         "estatisticas_gerais": {
             "total_operacoes": total_operacoes,
             "total_dias": total_dias,
@@ -2294,7 +2562,6 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
             "melhor_dia": round(melhor_dia, 2),
             "media_trades_por_dia": round(total_operacoes / total_dias, 1),
             "fator_disciplina_usado": float(fator_disciplina),
-            "multiplicador_furia_usado": float(multiplicador_furia),
             "coluna_quantidade_encontrada": quantidade_col if quantidade_disponivel else None
         },
         "resumo_comparativo": resumo,
@@ -2306,7 +2573,8 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
                 "pior_trade": round(float(row['Pior_Trade_Dia']), 2),
                 "status": "ganho" if row['PnL_Dia'] > 0 else "perda" if row['PnL_Dia'] < 0 else "breakeven",
                 "dentro_meta": bool(row['PnL_Dia'] >= disciplina_dia["meta_maxima_perda_dia"] if row['PnL_Dia'] < 0 else True),
-                "eh_furia": bool(abs(row['PnL_Dia']) > furia_diaria["limite_furia"] if furia_diaria["disponivel"] and row['PnL_Dia'] < 0 else False)
+                "alta_volatilidade": bool(row['PnL_Dia'] < analise_emocional["limite_2_desvios"]),
+                "desvios_da_media": round((float(row['PnL_Dia']) - analise_emocional["media_pnl_diario"]) / analise_emocional["desvio_padrao_diario"], 2) if analise_emocional["desvio_padrao_diario"] > 0 else 0
             }
             for _, row in resultado_diario.iterrows()
         ]
@@ -2319,11 +2587,12 @@ def api_disciplina_completa():
     """
     Endpoint ÚNICO para calcular TODAS as métricas de disciplina
     Suporta tanto um arquivo ('file') quanto múltiplos arquivos ('files')
+    Inclui análise emocional com desvio padrão e cálculo de risco de ruína
     """
     try:
         # Parâmetros opcionais
         fator_disciplina = float(request.form.get('fator_disciplina', 0.2))
-        multiplicador_furia = float(request.form.get('multiplicador_furia', 2.0))
+        multiplicador_furia = 2.0  # Mantido para compatibilidade mas não usado
         
         # Lista para armazenar todos os DataFrames
         dataframes = []
@@ -2519,7 +2788,8 @@ def api_tabela_multipla():
                 print(f"        📅 Colunas disponíveis: {list(df.columns)}")
                 trades_individual = processar_trades(df, {i: nome_arquivo})
                 print(f"        ✅ Trades processados: {len(trades_individual)}")
-                resultado_individual['trades'] = trades_individual
+                # Garantir que trades sempre seja um array (nunca None)
+                resultado_individual['trades'] = trades_individual if trades_individual is not None else []
                 
                 resultado_individual['info_arquivo'] = {
                     "nome_arquivo": nome_arquivo,
@@ -2570,7 +2840,8 @@ def api_tabela_multipla():
         for i, nome_arquivo in enumerate(arquivos_processados):
             arquivo_para_indices[i] = nome_arquivo
         trades_consolidados = processar_trades(df_consolidado, arquivo_para_indices)
-        resultado_consolidado['trades'] = trades_consolidados
+        # Garantir que trades sempre seja um array (nunca None)
+        resultado_consolidado['trades'] = trades_consolidados if trades_consolidados is not None else []
         
         resultado_consolidado['info_arquivos'] = {
             "total_arquivos": len(arquivos_processados),
@@ -3001,21 +3272,46 @@ def api_trades():
             df_consolidado['exit_date'] = pd.to_datetime(df_consolidado['exit_date'], errors='coerce')
 
         # Aplicar filtros opcionais
-        df_filtrado = df_consolidado
+        df_filtrado = df_consolidado.copy()  # CORRIGIDO: usar .copy() para evitar problemas
+        registros_antes_filtro = len(df_consolidado)
+        
         try:
             if filter_date and 'entry_date' in df_filtrado.columns:
                 _dia = pd.to_datetime(filter_date, errors='coerce').date()
                 df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.date == _dia]
+                print(f"🔍 Filtro por data {filter_date}: {len(df_filtrado)} registros")
+            
             if filter_weekday and 'entry_date' in df_filtrado.columns:
                 if str(filter_weekday).isdigit():
                     _idx = int(filter_weekday)
                     df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.weekday == _idx]
                 else:
                     df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.day_name() == filter_weekday]
+                print(f"🔍 Filtro por dia da semana {filter_weekday}: {len(df_filtrado)} registros")
+            
             if filter_month and 'entry_date' in df_filtrado.columns:
                 df_filtrado = df_filtrado[df_filtrado['entry_date'].dt.to_period('M').astype(str) == filter_month]
-        except Exception:
-            pass
+                print(f"🔍 Filtro por mês {filter_month}: {len(df_filtrado)} registros")
+                
+        except Exception as filter_error:
+            print(f"⚠️ Erro ao aplicar filtros: {filter_error}")
+            df_filtrado = df_consolidado.copy()  # Retornar aos dados originais em caso de erro
+
+        registros_apos_filtro = len(df_filtrado)
+        print(f"📊 Filtros aplicados: {registros_antes_filtro} → {registros_apos_filtro} registros")
+        
+        # IMPORTANTE: Se filtro resultou em DataFrame vazio, avisar usuário
+        if df_filtrado.empty:
+            print(f"⚠️ AVISO: Filtros resultaram em 0 registros")
+            return jsonify({
+                "error": "Filtros aplicados não retornaram nenhum resultado",
+                "filters_applied": {
+                    "date": filter_date,
+                    "weekday": filter_weekday,
+                    "month": filter_month
+                },
+                "suggestion": "Ajuste os filtros para incluir mais dados"
+            }), 400
 
         # Processar dados filtrados com mapeamento de arquivos
         trades = processar_trades(df_filtrado, arquivo_para_indices)
@@ -3215,8 +3511,9 @@ def api_daily_metrics():
             },
             "estatisticas_operacao": {
                 "media_operacoes_dia": performance_metrics.get("Avg Trades/Active Day", 0),
-                "taxa_acerto_diaria": performance_metrics.get("Win Rate (%)", 0),
-                "dias_vencedores_perdedores": "N/A",  # Não disponível no FunCalculos.py
+                "taxa_acerto_operacoes": performance_metrics.get("Win Rate (%)", 0),  # Win rate de OPERAÇÕES
+                "taxa_acerto_diaria": round((performance_metrics.get("Winning Days", 0) / performance_metrics.get("Active Days", 1) * 100), 2) if performance_metrics.get("Active Days", 0) > 0 else 0,  # Win rate de DIAS
+                "dias_vencedores_perdedores": f"{performance_metrics.get('Winning Days', 0)} / {performance_metrics.get('Losing Days', 0)}",
                 "dias_perdedores_consecutivos": performance_metrics.get("Max Consecutive Losses", 0),
                 "dias_vencedores_consecutivos": performance_metrics.get("Max Consecutive Wins", 0)
             }
@@ -3364,8 +3661,9 @@ def api_metrics_from_data():
             },
             "estatisticas_operacao": {
                 "media_operacoes_dia": performance_metrics.get("Avg Trades/Active Day", 0),
-                "taxa_acerto_diaria": performance_metrics.get("Win Rate (%)", 0),
-                "dias_vencedores_perdedores": "N/A",  # Não disponível no FunCalculos.py
+                "taxa_acerto_operacoes": performance_metrics.get("Win Rate (%)", 0),  # Win rate de OPERAÇÕES
+                "taxa_acerto_diaria": round((performance_metrics.get("Winning Days", 0) / performance_metrics.get("Active Days", 1) * 100), 2) if performance_metrics.get("Active Days", 0) > 0 else 0,  # Win rate de DIAS
+                "dias_vencedores_perdedores": f"{performance_metrics.get('Winning Days', 0)} / {performance_metrics.get('Losing Days', 0)}",  # Não disponível no FunCalculos.py
                 "dias_perdedores_consecutivos": performance_metrics.get("Max Consecutive Losses", 0),
                 "dias_vencedores_consecutivos": performance_metrics.get("Max Consecutive Wins", 0)
             }
@@ -3773,19 +4071,31 @@ def calcular_drawdown_padronizado(df: pd.DataFrame) -> Dict[str, float]:
     # Capital inicial estimado (baseado no pico máximo)
     capital_inicial = df_valid['peak'].max() if not df_valid['peak'].empty else 0.0
     
-    # Percentual do drawdown (baseado no capital inicial)
+    # Percentual do drawdown (baseado no pico máximo da equity, não no capital inicial)
+    # CORRIGIDO: Usar peak máximo como referência, que representa o melhor momento da conta
     max_drawdown_pct = (max_drawdown / capital_inicial * 100) if capital_inicial != 0 else 0.0
+    
+    # ALTERNATIVA: Calcular DD% baseado no saldo final + drawdown máximo (capital mínimo necessário)
+    # Isso representa: quanto % do capital você perdeu no pior momento
+    if saldo_final != 0:
+        # Capital estimado necessário = saldo_final + max_drawdown
+        capital_necessario = saldo_final + max_drawdown
+        max_drawdown_pct_alternativo = (max_drawdown / capital_necessario * 100) if capital_necessario != 0 else 0.0
+    else:
+        max_drawdown_pct_alternativo = 0.0
     
     # Logs de debug
     print(f"🔍 DEBUG - Drawdown Padronizado:")
     print(f"  Max Drawdown: R$ {max_drawdown:.2f}")
-    print(f"  Max Drawdown %: {max_drawdown_pct:.2f}%")
+    print(f"  Max Drawdown % (baseado no pico): {max_drawdown_pct:.2f}%")
+    print(f"  Max Drawdown % (baseado no capital necessário): {max_drawdown_pct_alternativo:.2f}%")
     print(f"  Saldo Final: R$ {saldo_final:.2f}")
-    print(f"  Capital Inicial: R$ {capital_inicial:.2f}")
+    print(f"  Pico Máximo (Capital Inicial Estimado): R$ {capital_inicial:.2f}")
     
     return {
         "max_drawdown": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
+        "max_drawdown_pct_alternativo": max_drawdown_pct_alternativo,  # NOVO: DD% baseado em capital necessário
         "saldo_final": saldo_final,
         "capital_inicial": capital_inicial
     }
