@@ -1,19 +1,446 @@
+import io
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 import calendar
 import warnings
+from typing import Dict, Any, List, Optional, Union
 
 # Suprimir warnings específicos do pandas
 warnings.filterwarnings('ignore', category=FutureWarning)
 
+def clean_numeric_value(value):
+    """Converte valores numéricos brasileiros para float seguro."""
+    if pd.isna(value) or value == '':
+        return np.nan
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+
+    str_value = str(value).strip()
+    if str_value == '':
+        return np.nan
+
+    # Remover separador de milhares (.)
+    if '.' in str_value and ',' in str_value:
+        integer_part, decimal_part = str_value.rsplit(',', 1)
+        integer_part = integer_part.replace('.', '')
+        cleaned = f"{integer_part}.{decimal_part}"
+    elif ',' in str_value:
+        cleaned = str_value.replace('.', '').replace(',', '.')
+    else:
+        # Pode ter múltiplos pontos como separador de milhar
+        parts = str_value.split('.')
+        if len(parts) > 1 and all(part.isdigit() for part in parts[1:]):
+            cleaned = ''.join(parts[:-1]) + '.' + parts[-1]
+        else:
+            cleaned = str_value
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return np.nan
+
+def _safe_mean(series, default=0.0, absolute: bool = False):
+    """Retorna média segura (sem NaN) com opção de valor absoluto."""
+    if series is None:
+        return default
+    series = series.dropna()
+    if series.empty:
+        return default
+    mean_value = series.mean()
+    if pd.isna(mean_value):
+        return default
+    mean_value = float(mean_value)
+    return abs(mean_value) if absolute else mean_value
+
+def _normalize_trades_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cria uma cópia do DataFrame com as colunas padrão utilizadas nos cálculos,
+    independentemente do layout original do CSV.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    normalized = df.copy()
+
+    # Datas de entrada e saída
+    if 'entry_date' not in normalized.columns and 'Abertura' in normalized.columns:
+        normalized['entry_date'] = pd.to_datetime(normalized['Abertura'], errors='coerce')
+    else:
+        normalized['entry_date'] = pd.to_datetime(normalized.get('entry_date'), errors='coerce')
+
+    if 'exit_date' not in normalized.columns and 'Fechamento' in normalized.columns:
+        normalized['exit_date'] = pd.to_datetime(normalized['Fechamento'], errors='coerce')
+    else:
+        normalized['exit_date'] = pd.to_datetime(normalized.get('exit_date'), errors='coerce')
+
+    # Resultado financeiro
+    if 'pnl' not in normalized.columns:
+        for col in ['operation_result', 'Res. Operação', 'Res. Intervalo', 'Resultado', 'Resultado Operação']:
+            if col in normalized.columns:
+                normalized['pnl'] = pd.to_numeric(normalized[col], errors='coerce')
+                break
+    else:
+        normalized['pnl'] = pd.to_numeric(normalized['pnl'], errors='coerce')
+
+    if 'pnl' not in normalized.columns:
+        normalized['pnl'] = 0.0
+
+    # Percentual
+    if 'pnl_pct' not in normalized.columns:
+        for col in ['operation_result_pct', 'Res. Operação (%)', 'Res. Intervalo (%)']:
+            if col in normalized.columns:
+                normalized['pnl_pct'] = pd.to_numeric(normalized[col], errors='coerce')
+                break
+
+    # Preços
+    if 'entry_price' not in normalized.columns and 'Preço Compra' in normalized.columns:
+        normalized['entry_price'] = pd.to_numeric(normalized['Preço Compra'], errors='coerce')
+    elif 'entry_price' in normalized.columns:
+        normalized['entry_price'] = pd.to_numeric(normalized['entry_price'], errors='coerce')
+
+    if 'exit_price' not in normalized.columns and 'Preço Venda' in normalized.columns:
+        normalized['exit_price'] = pd.to_numeric(normalized['Preço Venda'], errors='coerce')
+    elif 'exit_price' in normalized.columns:
+        normalized['exit_price'] = pd.to_numeric(normalized['exit_price'], errors='coerce')
+
+    # Quantidades
+    if 'qty_buy' not in normalized.columns and 'Qtd Compra' in normalized.columns:
+        normalized['qty_buy'] = pd.to_numeric(normalized['Qtd Compra'], errors='coerce')
+    elif 'qty_buy' in normalized.columns:
+        normalized['qty_buy'] = pd.to_numeric(normalized['qty_buy'], errors='coerce')
+
+    if 'qty_sell' not in normalized.columns and 'Qtd Venda' in normalized.columns:
+        normalized['qty_sell'] = pd.to_numeric(normalized['Qtd Venda'], errors='coerce')
+    elif 'qty_sell' in normalized.columns:
+        normalized['qty_sell'] = pd.to_numeric(normalized['qty_sell'], errors='coerce')
+
+    candidate_quantity_cols = [
+        'quantity_total', 'quantity', 'Contracts', 'contracts', 'Quantidade', 'Qtd Contratos', 'Qtd', 'position', 'Position', 'Qtd Total'
+    ]
+
+    position_candidates = []
+    for col in ['qty_buy', 'qty_sell']:
+        if col in normalized.columns:
+            position_candidates.append(normalized[col].abs())
+
+    for col in candidate_quantity_cols:
+        if col in normalized.columns:
+            position_candidates.append(pd.to_numeric(normalized[col], errors='coerce').abs())
+
+    if position_candidates:
+        position_df = pd.concat(position_candidates, axis=1)
+        normalized['position_size'] = position_df.max(axis=1, skipna=True)
+    else:
+        normalized['position_size'] = np.nan
+
+    # Se nenhuma quantidade foi encontrada, assumir 1 contrato por trade
+    normalized['position_size'] = normalized['position_size'].fillna(1).astype(float)
+
+    # Direção e ativo
+    if 'direction' not in normalized.columns and 'Lado' in normalized.columns:
+        normalized['direction'] = normalized['Lado']
+    if 'symbol' not in normalized.columns and 'Ativo' in normalized.columns:
+        normalized['symbol'] = normalized['Ativo']
+
+    # Duração em minutos
+    if 'entry_date' in normalized.columns and 'exit_date' in normalized.columns:
+        durations = (normalized['exit_date'] - normalized['entry_date']).dt.total_seconds() / 60
+        normalized['duration_minutes'] = durations.clip(lower=0).fillna(0)
+    else:
+        normalized['duration_minutes'] = 0.0
+
+    return normalized
+
+def _format_minutes(value: float) -> str:
+    """Converte minutos em string humanizada (Hh Mm)."""
+    if pd.isna(value):
+        value = 0
+    total_minutes = max(0, float(value))
+    hours = int(total_minutes // 60)
+    minutes = int(round(total_minutes % 60))
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+def calcular_dimensionamento_posicao(df: pd.DataFrame) -> Dict[str, Any]:
+    normalized = _normalize_trades_dataframe(df)
+    if normalized.empty:
+        return {
+            "hasData": False,
+            "average": 0.0,
+            "median": 0.0,
+            "maximum": 0.0,
+            "dailyTurnover": 0.0,
+            "distribution": []
+        }
+
+    qty_series = normalized['position_size'].dropna()
+    if qty_series.empty:
+        return {
+            "hasData": False,
+            "average": 0.0,
+            "median": 0.0,
+            "maximum": 0.0,
+            "dailyTurnover": 0.0,
+            "distribution": []
+        }
+
+    qty_series = qty_series.astype(float)
+    average = qty_series.mean()
+    median = qty_series.median()
+    maximum = qty_series.max()
+
+    if 'entry_date' in normalized.columns:
+        normalized['date_only'] = pd.to_datetime(normalized['entry_date']).dt.date
+        turnover = normalized.dropna(subset=['position_size']).groupby('date_only')['position_size'].sum()
+        daily_turnover = turnover.mean() if not turnover.empty else average
+    else:
+        daily_turnover = average
+
+    distribution = []
+    grouped = normalized.dropna(subset=['position_size']).groupby('position_size')
+    total_trades = len(qty_series)
+
+    for pos_size, sub_df in grouped:
+        pnl = pd.to_numeric(sub_df.get('pnl', 0), errors='coerce').fillna(0)
+        trades = len(sub_df)
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        gross_profit = wins.sum()
+        gross_loss = abs(losses.sum())
+        profit_factor = gross_profit / gross_loss if gross_loss != 0 else 0.0
+        win_rate = len(wins) / trades * 100 if trades > 0 else 0.0
+        avg_win = wins.mean() if len(wins) > 0 else 0.0
+        avg_loss = abs(losses.mean()) if len(losses) > 0 else 0.0
+        payoff = avg_win / avg_loss if avg_loss else 0.0
+
+        distribution.append({
+            "contracts": float(pos_size),
+            "trades": trades,
+            "percent": round(trades / total_trades * 100, 2) if total_trades > 0 else 0.0,
+            "profitFactor": round(profit_factor, 2),
+            "winRate": round(win_rate, 2),
+            "payoff": round(payoff, 2),
+            "result": round(float(pnl.sum()), 2)
+        })
+
+    distribution.sort(key=lambda x: (-x["trades"], -x["contracts"]))
+
+    return {
+        "hasData": True,
+        "average": round(float(average), 2),
+        "median": round(float(median), 2),
+        "maximum": round(float(maximum), 2),
+        "dailyTurnover": round(float(daily_turnover), 2),
+        "distribution": distribution
+    }
+
+def calcular_duracao_trades_resumo(df: pd.DataFrame) -> Dict[str, Any]:
+    normalized = _normalize_trades_dataframe(df)
+    if normalized.empty or 'duration_minutes' not in normalized.columns:
+        return {
+            "hasData": False,
+            "averageMinutes": 0.0,
+            "medianMinutes": 0.0,
+            "maxMinutes": 0.0,
+            "average": "0m",
+            "median": "0m",
+            "maximum": "0m",
+            "distribution": []
+        }
+
+    durations = normalized['duration_minutes'].dropna()
+    if durations.empty:
+        return {
+            "hasData": False,
+            "averageMinutes": 0.0,
+            "medianMinutes": 0.0,
+            "maxMinutes": 0.0,
+            "average": "0m",
+            "median": "0m",
+            "maximum": "0m",
+            "distribution": []
+        }
+
+    avg = durations.mean()
+    med = durations.median()
+    mx = durations.max()
+
+    # Distribuição simples por faixas de duração
+    bins = [0, 15, 30, 60, 120, np.inf]
+    labels = ["0-15m", "15-30m", "30-60m", "60-120m", ">120m"]
+    normalized['duration_bucket'] = pd.cut(durations, bins=bins, labels=labels, include_lowest=True)
+    normalized['duration_bucket'] = normalized['duration_bucket'].astype(pd.CategoricalDtype(categories=labels, ordered=True))
+    distribution = []
+    bucket_group = normalized.groupby('duration_bucket', observed=True)
+
+    for label, sub in bucket_group:
+        if sub is None or sub.empty:
+            continue
+        pnl = pd.to_numeric(sub.get('pnl', 0), errors='coerce').fillna(0)
+        trades = len(sub)
+        gross_profit = pnl[pnl > 0].sum()
+        gross_loss = abs(pnl[pnl < 0].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss != 0 else 0.0
+        win_rate = (pnl > 0).sum() / trades * 100 if trades > 0 else 0.0
+        avg_win = pnl[pnl > 0].mean() if (pnl > 0).any() else 0.0
+        avg_loss = abs(pnl[pnl < 0].mean()) if (pnl < 0).any() else 0.0
+        payoff = avg_win / avg_loss if avg_loss else 0.0
+
+        distribution.append({
+            "bucket": label,
+            "trades": trades,
+            "profitFactor": round(profit_factor, 2),
+            "winRate": round(win_rate, 2),
+            "payoff": round(payoff, 2),
+            "result": round(float(pnl.sum()), 2)
+        })
+
+    return {
+        "hasData": True,
+        "averageMinutes": round(float(avg), 2),
+        "medianMinutes": round(float(med), 2),
+        "maxMinutes": round(float(mx), 2),
+        "average": _format_minutes(avg),
+        "median": _format_minutes(med),
+        "maximum": _format_minutes(mx),
+        "distribution": distribution
+    }
+
+def calcular_custos_backtest(df: pd.DataFrame, taxa_corretagem: float = 0.0, taxa_emolumentos: float = 0.0) -> Dict[str, Any]:
+    normalized = _normalize_trades_dataframe(df)
+    if normalized.empty:
+        return {
+            "hasData": False,
+            "totalTrades": 0,
+            "valorOperado": 0.0,
+            "corretagem": 0.0,
+            "emolumentos": 0.0,
+            "custoTotal": 0.0,
+            "custoPorTrade": 0.0
+        }
+
+    if 'entry_price' not in normalized.columns or 'exit_price' not in normalized.columns:
+        return {
+            "hasData": False,
+            "totalTrades": int(len(normalized)),
+            "valorOperado": 0.0,
+            "corretagem": 0.0,
+            "emolumentos": 0.0,
+            "custoTotal": 0.0,
+            "custoPorTrade": 0.0
+        }
+
+    df_valid = normalized.dropna(subset=['entry_price', 'exit_price'])
+    total_trades = len(df_valid)
+    if total_trades == 0:
+        return {
+            "hasData": False,
+            "totalTrades": 0,
+            "valorOperado": 0.0,
+            "corretagem": 0.0,
+            "emolumentos": 0.0,
+            "custoTotal": 0.0,
+            "custoPorTrade": 0.0
+        }
+
+    valor_entrada = df_valid['entry_price'] * df_valid['position_size']
+    valor_saida = df_valid['exit_price'] * df_valid['position_size']
+    valor_total_operado = float((valor_entrada + valor_saida).sum())
+
+    custo_corretagem = total_trades * taxa_corretagem
+    custo_emolumentos = valor_total_operado * (taxa_emolumentos / 100.0)
+    custo_total = custo_corretagem + custo_emolumentos
+
+    return {
+        "hasData": True,
+        "totalTrades": int(total_trades),
+        "valorOperado": round(valor_total_operado, 2),
+        "corretagem": round(custo_corretagem, 2),
+        "emolumentos": round(custo_emolumentos, 2),
+        "custoTotal": round(custo_total, 2),
+        "custoPorTrade": round(custo_total / total_trades, 2) if total_trades > 0 else 0.0
+    }
+
+def _read_csv_with_header(file_obj):
+    """
+    Lê conteúdo do CSV e garante que o cabeçalho real (linha com 'Ativo;') seja usado.
+    Retorna DataFrame com os dados brutos.
+    """
+    try:
+        if hasattr(file_obj, 'read'):
+            original_position = file_obj.tell()
+            raw_content = file_obj.read()
+            if isinstance(raw_content, bytes):
+                raw_content = raw_content.decode('latin1', errors='ignore')
+            file_obj.seek(original_position)
+        else:
+            with open(file_obj, 'rb') as fh:
+                raw_content = fh.read().decode('latin1', errors='ignore')
+    except Exception as exc:
+        raise ValueError(f"Erro ao ler o arquivo CSV: {exc}")
+
+    lines = raw_content.splitlines()
+    header_idx = next((idx for idx, line in enumerate(lines) if 'Ativo;' in line), None)
+    if header_idx is None:
+        raise ValueError("Cabeçalho 'Ativo;...' não encontrado no CSV.")
+
+    csv_text = '\n'.join(lines[header_idx:])
+    data_buffer = io.StringIO(csv_text)
+    return pd.read_csv(data_buffer, sep=';', decimal=',', encoding='latin1')
+
+def _compute_equity_components(pnl_series: pd.Series):
+    """
+    Calcula curvas de equity, pico e drawdown com baseline iniciando em 0.
+    Retorna (equity, peak, drawdown, max_drawdown, max_drawdown_pct).
+    """
+    if pnl_series is None or pnl_series.empty:
+        empty = pd.Series(dtype=float)
+        return empty, empty, empty, 0.0, 0.0
+
+    pnl_series = pnl_series.fillna(0)
+    equity = pnl_series.cumsum()
+    equity_with_start = pd.concat([pd.Series([0.0], index=[-1]), equity])
+    peak = equity_with_start.cummax()
+    drawdown = equity_with_start - peak
+
+    # Remover ponto inicial artificial
+    equity = equity_with_start.iloc[1:]
+    peak = peak.iloc[1:]
+    drawdown = drawdown.iloc[1:]
+
+    if drawdown.empty:
+        return equity, peak, drawdown, 0.0, 0.0
+
+    max_dd = float(abs(drawdown.min()))
+    peak_max = peak.max()
+    max_dd_pct = float((max_dd / peak_max * 100) if peak_max not in (0, np.nan) else 0.0)
+
+    return equity, peak, drawdown, max_dd, max_dd_pct
+
 def carregar_csv(file):
     try:
-        df = pd.read_csv(file, skiprows=5, sep=';', encoding='latin1', decimal=',')
-        df['Abertura']   = pd.to_datetime(df['Abertura'],   format="%d/%m/%Y %H:%M:%S")
-        df['Fechamento'] = pd.to_datetime(df['Fechamento'], format="%d/%m/%Y %H:%M:%S")
-        df['Res. Operação']     = pd.to_numeric(df['Res. Operação'],     errors='coerce')
-        df['Res. Operação (%)'] = pd.to_numeric(df['Res. Operação (%)'], errors='coerce')
+        df = _read_csv_with_header(file)
+
+        if 'Abertura' in df.columns:
+            df['Abertura'] = pd.to_datetime(df['Abertura'], format="%d/%m/%Y %H:%M:%S", errors='coerce')
+        if 'Fechamento' in df.columns:
+            df['Fechamento'] = pd.to_datetime(df['Fechamento'], format="%d/%m/%Y %H:%M:%S", errors='coerce')
+
+        numeric_columns = [
+            'Res. Operação', 'Res. Operação (%)',
+            'Res. Intervalo', 'Res. Intervalo (%)',
+            'Res. Intervalo Bruto', 'Res. Intervalo Bruto (%)',
+            'Preço Compra', 'Preço Venda', 'Preço de Mercado', 'Médio',
+            'Qtd Compra', 'Qtd Venda', 'Drawdown', 'Ganho Max.', 'Perda Max.', 'Total'
+        ]
+
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = df[col].apply(clean_numeric_value)
+
         return df
     except Exception as e:
         raise ValueError(f"Erro ao processar CSV: {e}")
@@ -97,17 +524,17 @@ def calcular_performance(df, cdi=0.12):
     profit_trades = df[pnl > 0]
     loss_trades = df[pnl < 0]
     gross_profit = profit_trades[pnl_col].sum()
-    gross_loss = loss_trades[pnl_col].sum()
-    avg_win = profit_trades[pnl_col].mean() or 0
-    avg_loss = loss_trades[pnl_col].mean() or 0
+    gross_loss = abs(loss_trades[pnl_col].sum())
+    avg_win = _safe_mean(profit_trades[pnl_col])
+    avg_loss = _safe_mean(loss_trades[pnl_col], absolute=True)
     avg_per_trade = net_profit / total_trades if total_trades > 0 else 0
     win_rate = len(profit_trades) / total_trades * 100 if total_trades > 0 else 0
     profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 else 0
     payoff = avg_win / abs(avg_loss) if avg_loss != 0 else 0
 
-    returns = pnl.values
-    mean_return = np.mean(returns)
-    std_return = np.std(returns, ddof=1)
+    returns = pnl.dropna().values
+    mean_return = np.mean(returns) if len(returns) > 0 else 0
+    std_return = np.std(returns, ddof=1) if len(returns) > 1 else 0
     sharpe_ratio = ((mean_return - cdi) / std_return) if std_return != 0 else 0
     # Determinar coluna de data
     if 'entry_date' in df.columns:
@@ -124,11 +551,7 @@ def calcular_performance(df, cdi=0.12):
     media_operacoes_por_dia = total_trades / dias_com_operacoes if dias_com_operacoes > 0 else 0
 
     # PADRONIZADO: Calcular drawdown usando método centralizado
-    equity = pnl.cumsum()
-    peak = equity.cummax()
-    dd_ser = equity - peak
-    max_dd = abs(dd_ser.min()) if not dd_ser.empty else 0  # Valor positivo
-    pct_dd = (max_dd / peak.max() * 100) if peak.max() != 0 else 0  # Baseado no pico máximo
+    equity, peak, dd_ser, max_dd, pct_dd = _compute_equity_components(pnl)
     
     # CALCULAR DD MÉDIO - CORREÇÃO ADICIONADA
     # Calcular drawdown médio baseado nos trades individuais
@@ -148,7 +571,8 @@ def calcular_performance(df, cdi=0.12):
         else:
             cur_loss_sum = 0.0
     trade_dd = max_seq_loss
-    trade_dd_pct = abs(trade_dd) / equity.iloc[-1] * 100 if equity.iloc[-1] != 0 else 0
+    ending_equity = equity.iloc[-1] if len(equity) > 0 else 0
+    trade_dd_pct = abs(trade_dd) / ending_equity * 100 if ending_equity != 0 else 0
 
     max_seq_win = max_seq_loss_cnt = 0
     cw = cl = 0
@@ -259,8 +683,8 @@ def calcular_day_of_week(df, cdi=0.12):
         win_rate = len(wins) / trades * 100 if trades > 0 else 0
         
         # Calcular média de ganho e perda
-        avg_win = wins[pnl_col].mean() if len(wins) > 0 else 0
-        avg_loss = abs(losses[pnl_col].mean()) if len(losses) > 0 else 0
+        avg_win = _safe_mean(wins[pnl_col])
+        avg_loss = _safe_mean(losses[pnl_col], absolute=True)
         
         # Calcular rentabilidade total (lucro total do período)
         rentabilidade_total = lucro
@@ -321,6 +745,40 @@ def calcular_monthly(df, cdi=0.12):
         return {}
     
     # Ordenar por data de abertura para cálculo correto do drawdown
+    df = df[df[date_col].notna()].copy()
+    if df.empty:
+        start_ts = pd.Timestamp.utcnow()
+        return [{
+            "date": start_ts.strftime('%Y-%m-%d'),
+            "fullDate": start_ts.strftime('%d/%m/%Y'),
+            "saldo": 0.0,
+            "valor": float(capital_inicial),
+            "resultado": 0.0,
+            "drawdown": 0.0,
+            "drawdownPercent": 0.0,
+            "peak": float(capital_inicial),
+            "trades": 0,
+            "isStart": True
+        }]
+
+    df = df[df[date_col].notna()].copy()
+    if df.empty:
+        start_ts = pd.Timestamp.utcnow()
+        return [{
+            "date": start_ts.strftime('%Y-%m-%d'),
+            "fullDate": start_ts.strftime('%d/%m/%Y'),
+            "saldo": 0.0,
+            "valor": float(capital_inicial),
+            "resultado": 0.0,
+            "drawdown": 0.0,
+            "drawdownPercent": 0.0,
+            "peak": float(capital_inicial),
+            "trades": 0,
+            "resultado_periodo": 0.0,
+            "periodo": agrupar_por,
+            "isStart": True
+        }]
+
     df = df.sort_values(date_col).reset_index(drop=True)
     
     # Calcular equity curve global para drawdown correto
@@ -346,8 +804,8 @@ def calcular_monthly(df, cdi=0.12):
             win_rate = len(wins) / trades * 100 if trades > 0 else 0
             
             # Calcular média de ganho e perda
-            avg_win = wins[pnl_col].mean() if len(wins) > 0 else 0
-            avg_loss = abs(losses[pnl_col].mean()) if len(losses) > 0 else 0
+            avg_win = _safe_mean(wins[pnl_col])
+            avg_loss = _safe_mean(losses[pnl_col], absolute=True)
             
             # Calcular drawdown máximo do mês
             max_drawdown_mes = sub['Drawdown'].min() if not sub['Drawdown'].empty else 0
@@ -434,8 +892,8 @@ def calcular_weekly(df, cdi=0.12):
         win_rate = len(wins) / trades * 100 if trades > 0 else 0
         
         # Calcular média de ganho e perda
-        avg_win = wins[pnl_col].mean() if len(wins) > 0 else 0
-        avg_loss = abs(losses[pnl_col].mean()) if len(losses) > 0 else 0
+        avg_win = _safe_mean(wins[pnl_col])
+        avg_loss = _safe_mean(losses[pnl_col], absolute=True)
         
         # Calcular rentabilidade total (lucro total do período)
         rentabilidade_total = lucro
@@ -490,9 +948,10 @@ def calcular_dados_grafico(df, capital_inicial=100000):
     df = df.sort_values(date_col).reset_index(drop=True)
     
     # Calcular equity curve trade por trade (PADRONIZADO: apenas saldo cumulativo)
-    df['Saldo'] = df[pnl_col].cumsum()
-    df['Saldo_Maximo'] = df['Saldo'].cummax()
-    df['Drawdown'] = df['Saldo'] - df['Saldo_Maximo']
+    equity, peak, drawdown, _, _ = _compute_equity_components(df[pnl_col])
+    df['Saldo'] = equity
+    df['Saldo_Maximo'] = peak
+    df['Drawdown'] = drawdown
     
     # Calcular valor da carteira (para compatibilidade, mas não usado no drawdown)
     df['Valor_Carteira'] = capital_inicial + df['Saldo']
@@ -505,10 +964,10 @@ def calcular_dados_grafico(df, capital_inicial=100000):
     # Preparar dados para o gráfico
     grafico_dados = []
     
-    # Ponto inicial
+    first_date = df[date_col].iloc[0]
     grafico_dados.append({
-        "date": df[date_col].iloc[0].strftime('%Y-%m-%d'),
-        "fullDate": df[date_col].iloc[0].strftime('%d/%m/%Y'),
+        "date": first_date.strftime('%Y-%m-%d'),
+        "fullDate": first_date.strftime('%d/%m/%Y'),
         "saldo": 0.0,  # Saldo inicial sempre 0
         "valor": float(capital_inicial),  # Patrimônio inicial
         "resultado": 0.0,  # Resultado inicial sempre 0
@@ -570,9 +1029,10 @@ def calcular_dados_grafico_agrupado(df, capital_inicial=0, agrupar_por='dia'):
     df = df.sort_values(date_col).reset_index(drop=True)
     
     # Calcular equity curve trade por trade (PADRONIZADO: apenas saldo cumulativo)
-    df['Saldo'] = df[pnl_col].cumsum()
-    df['Saldo_Maximo'] = df['Saldo'].cummax()
-    df['Drawdown'] = df['Saldo'] - df['Saldo_Maximo']
+    equity, peak, drawdown, _, _ = _compute_equity_components(df[pnl_col])
+    df['Saldo'] = equity
+    df['Saldo_Maximo'] = peak
+    df['Drawdown'] = drawdown
     
     # Calcular valor da carteira (para compatibilidade, mas não usado no drawdown)
     df['Valor_Carteira'] = capital_inicial + df['Saldo']
@@ -634,7 +1094,23 @@ def calcular_dados_grafico_agrupado(df, capital_inicial=0, agrupar_por='dia'):
     # Preparar dados para o gráfico
     grafico_dados = []
     
-    # Ponto inicial
+    if grupos.empty:
+        start_ts = pd.Timestamp.utcnow()
+        return [{
+            "date": start_ts.strftime('%Y-%m-%d'),
+            "fullDate": start_ts.strftime('%d/%m/%Y'),
+            "saldo": 0.0,
+            "valor": float(capital_inicial),
+            "resultado": 0.0,
+            "drawdown": 0.0,
+            "drawdownPercent": 0.0,
+            "peak": float(capital_inicial),
+            "trades": 0,
+            "resultado_periodo": 0.0,
+            "periodo": agrupar_por,
+            "isStart": True
+        }]
+
     primeira_data = grupos['Abertura'].iloc[0] if len(grupos) > 0 else pd.Timestamp('2024-01-01')
     grafico_dados.append({
         "date": primeira_data.strftime('%Y-%m-%d'),
@@ -713,6 +1189,11 @@ def processar_backtest_completo(df, capital_inicial=100000, cdi=0.12):
             "weekly": calcular_dados_grafico_agrupado(df, capital_inicial, 'semana'),
             "monthly": calcular_dados_grafico_agrupado(df, capital_inicial, 'mes')
         }
+
+        # ✅ NOVO: Estatísticas complementares (posição, duração, custos)
+        position_sizing = calcular_dimensionamento_posicao(df)
+        trade_duration = calcular_duracao_trades_resumo(df)
+        operational_costs = calcular_custos_backtest(df)
         
         # ✅ CORREÇÃO: Resposta completa com otimizações
         return {
@@ -720,7 +1201,10 @@ def processar_backtest_completo(df, capital_inicial=100000, cdi=0.12):
             "Monthly Analysis": monthly,
             "Day of Week Analysis": day_of_week,
             "Weekly Analysis": weekly,
-            "Equity Curve Data": equity_curve_data
+            "Equity Curve Data": equity_curve_data,
+            "Position Sizing": position_sizing,
+            "Trade Duration": trade_duration,
+            "Operational Costs": operational_costs
         }
     except Exception as e:
         print(f"❌ Erro ao processar backtest completo: {e}")

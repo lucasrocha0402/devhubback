@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Tuple
+from pathlib import Path
 
 # Carregar variáveis de ambiente de múltiplas localizações para maior robustez
 # 1) .env do diretório atual (python-freela/.env)
@@ -215,6 +216,124 @@ def clean_numeric_value(value):
     except ValueError:
         return np.nan
 
+
+def _parse_filters_from_request(req) -> Dict[str, Any]:
+    """Extrai filtros básicos do request (direção, etc.)."""
+    filters: Dict[str, Any] = {}
+
+    raw_filters = req.form.get('filters') or req.form.get('filtros')
+    if raw_filters:
+        try:
+            parsed = json.loads(raw_filters)
+            if isinstance(parsed, dict):
+                filters.update(parsed)
+        except json.JSONDecodeError:
+            pass
+
+    for key in ('direction', 'direcao', 'directions', 'side'):
+        value = req.form.get(key)
+        if value:
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = value
+            filters['direction'] = parsed
+            break
+
+    return filters
+
+
+_DIRECTION_MAP = {
+    'long': {'long'},
+    'short': {'short'},
+    'buy': {'long'},
+    'sell': {'short'},
+    'compra': {'long'},
+    'venda': {'short'},
+    'comprado': {'long'},
+    'vendido': {'short'},
+    'c': {'long'},
+    'v': {'short'},
+    'compra+venda': {'long', 'short'},
+    'compra + venda': {'long', 'short'},
+    'all': set(),
+    'todos': set(),
+    'ambos': {'long', 'short'},
+    'ambas': {'long', 'short'}
+}
+
+
+def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.DataFrame:
+    """Aplica filtros padrão (como direção) ao DataFrame."""
+    if df.empty or not filtros:
+        return df
+
+    df_filtrado = df.copy()
+
+    direction_filter = (
+        filtros.get('direction')
+        or filtros.get('directions')
+        or filtros.get('side')
+        or filtros.get('direcao')
+    )
+
+    if direction_filter:
+        direction_col = None
+        for candidate in ('direction', 'Lado', 'lado'):
+            if candidate in df_filtrado.columns:
+                direction_col = candidate
+                break
+
+        if direction_col is None:
+            return df_filtrado
+
+        direction_series = df_filtrado[direction_col].astype(str).str.strip()
+        mapped_direction = direction_series.str.lower().map({
+            'c': 'long',
+            'compra': 'long',
+            'comprado': 'long',
+            'v': 'short',
+            'venda': 'short',
+            'vendido': 'short'
+        })
+
+        if direction_col != 'direction':
+            df_filtrado['_direction_tmp_'] = mapped_direction.fillna(direction_series.str.lower())
+            direction_column_to_use = '_direction_tmp_'
+        else:
+            df_filtrado['_direction_tmp_'] = direction_series.str.lower()
+            direction_column_to_use = '_direction_tmp_'
+
+        if isinstance(direction_filter, (list, tuple, set)):
+            requested = list(direction_filter)
+        else:
+            requested = [direction_filter]
+
+        allowed = set()
+        for item in requested:
+            if item is None:
+                continue
+            normalized = str(item).strip().lower()
+            if normalized in _DIRECTION_MAP:
+                mapped = _DIRECTION_MAP[normalized]
+                if not mapped:  # represents 'all'
+                    allowed = set()
+                    break
+                allowed.update(mapped)
+            else:
+                # tentar correspondência parcial (ex.: 'compra' dentro de 'compra (long)')
+                if 'compra' in normalized:
+                    allowed.update(_DIRECTION_MAP['compra'])
+                elif 'venda' in normalized:
+                    allowed.update(_DIRECTION_MAP['venda'])
+
+        if allowed:
+            df_filtrado = df_filtrado[df_filtrado[direction_column_to_use].isin(allowed)]
+
+        df_filtrado = df_filtrado.drop(columns=['_direction_tmp_'], errors='ignore')
+
+    return df_filtrado
+
 def carregar_csv_trades(file_path_or_file):
     """Carrega CSV da planilha de trades com mapeamento específico e parsing melhorado"""
     try:
@@ -296,141 +415,129 @@ def carregar_csv_trades(file_path_or_file):
 def carregar_csv_safe(file_path_or_file):
     """Função auxiliar para carregar CSV com encoding seguro baseada na função original"""
     try:
-        # Tentar diferentes encodings e formatos
-        encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-        formats_to_try = [
-            {'skiprows': 0, 'sep': ',', 'encoding': None},
-            {'skiprows': 5, 'sep': ';', 'encoding': None, 'decimal': ','},
-            {'skiprows': 0, 'sep': ',', 'encoding': None},
-            {'skiprows': 5, 'sep': ';', 'encoding': None, 'decimal': ','}
-        ]
-        
-        df = None
-        last_error = None
-        
-        for encoding in encodings_to_try:
-            for format_config in formats_to_try:
-                try:
-                    if hasattr(file_path_or_file, 'read'):
-                        file_path_or_file.seek(0)  # Reset file pointer
-                        format_config['encoding'] = encoding
-                        df = pd.read_csv(file_path_or_file, **format_config)
-                    else:
-                        format_config['encoding'] = encoding
-                        df = pd.read_csv(file_path_or_file, **format_config)
-                    
-                    # Verificar se tem colunas esperadas
-                    expected_columns = ['entry_date', 'exit_date', 'pnl', 'Abertura', 'Fechamento', 'Res. Operação', 'Res. Intervalo']
-                    found_columns = [col for col in expected_columns if col in df.columns]
-                    
-                    if found_columns:
-                        break
-                    else:
-                        continue
-                        
-                except Exception as e:
-                    last_error = e
-                    continue
-            
-            if df is not None and len(df.columns) > 0:
-                break
-        
-        if df is None or len(df.columns) == 0:
-            raise ValueError(f"Não foi possível ler o CSV com nenhum encoding/formato. Último erro: {last_error}")
-        
-        # Não criar colunas duplicadas aqui - vamos renomear diretamente
-        
-        # Processar datas conforme função original - com verificação de colunas
-        if 'Abertura' in df.columns:
-            df['Abertura']   = pd.to_datetime(df['Abertura'],   format="%d/%m/%Y %H:%M:%S", errors='coerce')
-        if 'Fechamento' in df.columns:
-            df['Fechamento'] = pd.to_datetime(df['Fechamento'], format="%d/%m/%Y %H:%M:%S", errors='coerce')
-        
-        # Usar função de limpeza para valores numéricos
-        numeric_columns = ['Res. Operação', 'Res. Operação (%)', 'Preço Compra', 'Preço Venda', 
-                          'Preço de Mercado', 'Médio', 'Res. Intervalo', 'Res. Intervalo (%)',
-                          'Drawdown', 'Ganho Max.', 'Perda Max.', 'Qtd Compra', 'Qtd Venda']
-        
-        for col in numeric_columns:
-            if col in df.columns:
-                df[col] = df[col].apply(clean_numeric_value)
-        
-        # Renomear colunas para padronizar
-        column_mapping = {
-            'Ativo': 'symbol',
-            'Abertura': 'entry_date',
-            'Fechamento': 'exit_date',
-            'Tempo Operação': 'duration_str',
-            'Qtd Compra': 'qty_buy',
-            'Qtd Venda': 'qty_sell',
-            'Lado': 'direction',
-            'Preço Compra': 'entry_price',
-            'Preço Venda': 'exit_price',
-            'Preço de Mercado': 'market_price',
-            'Médio': 'avg_price',
-            'Res. Intervalo': 'pnl',
-            'Res. Intervalo (%)': 'pnl_pct',
-            'Res. Intervalo Bruto': 'pnl',
-            'Res. Intervalo Bruto (%)': 'pnl_pct',
-            'Número Operação': 'trade_number',
-            'Res. Operação': 'operation_result',
-            'Res. Operação (%)': 'operation_result_pct',
-            'Drawdown': 'drawdown',
-            'Ganho Max.': 'max_gain',
-            'Perda Max.': 'max_loss',
-            'TET': 'tet',
-            'Total': 'total'
-        }
-        
-        # Renomear colunas existentes
-        df = df.rename(columns=column_mapping)
-        
-        # Converter direção para formato padrão
-        if 'direction' in df.columns:
-            df['direction'] = df['direction'].map({'C': 'long', 'V': 'short'}).fillna('long')
-        
-        # Garantir que a coluna 'pnl' exista e seja numérica
-        if 'pnl' not in df.columns and 'operation_result' in df.columns:
-            df['pnl'] = df['operation_result']
-        if 'pnl' in df.columns:
-            df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
-        
-        # Calcular duração em horas se não existir
-        if 'entry_date' in df.columns and 'exit_date' in df.columns:
-            # Garantir que as datas são datetime
-            try:
-                if hasattr(df['entry_date'], 'dtype') and df['entry_date'].dtype == 'object':
-                    df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
-                if hasattr(df['exit_date'], 'dtype') and df['exit_date'].dtype == 'object':
-                    df['exit_date'] = pd.to_datetime(df['exit_date'], errors='coerce')
-                
-                # Calcular duração apenas se as datas são válidas
-                valid_dates = df['entry_date'].notna() & df['exit_date'].notna()
-                if valid_dates.any():
+        # Usar primeiro a rotina padronizada do FunCalculos (detecção automática de cabeçalho)
+        if hasattr(file_path_or_file, 'seek'):
+            file_path_or_file.seek(0)
+        df = carregar_csv(file_path_or_file)
+    except Exception as primary_error:
+        print(f"🔍 DEBUG: Fallback para leitura manual do CSV ({primary_error})")
+        try:
+            encodings_to_try = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+            formats_to_try = [
+                {'skiprows': 0, 'sep': ',', 'encoding': None},
+                {'skiprows': 5, 'sep': ';', 'encoding': None, 'decimal': ','},
+                {'skiprows': 0, 'sep': ',', 'encoding': None},
+                {'skiprows': 5, 'sep': ';', 'encoding': None, 'decimal': ','}
+            ]
+
+            df = None
+            last_error = primary_error
+
+            for encoding in encodings_to_try:
+                for format_config in formats_to_try:
                     try:
-                        # Calcular duração corretamente usando Series
-                        duration_series = (df.loc[valid_dates, 'exit_date'] - df.loc[valid_dates, 'entry_date'])
-                        df.loc[valid_dates, 'duration_hours'] = duration_series.dt.total_seconds() / 3600
+                        if hasattr(file_path_or_file, 'read'):
+                            file_path_or_file.seek(0)
+                            format_config['encoding'] = encoding
+                            df = pd.read_csv(file_path_or_file, **format_config)
+                        else:
+                            format_config['encoding'] = encoding
+                            df = pd.read_csv(file_path_or_file, **format_config)
+
+                        expected_columns = ['entry_date', 'exit_date', 'pnl', 'Abertura', 'Fechamento', 'Res. Operação', 'Res. Intervalo']
+                        found_columns = [col for col in expected_columns if col in df.columns]
+                        if found_columns:
+                            break
                     except Exception as e:
-                        print(f"🔍 DEBUG: Erro ao calcular duração: {e}")
-                        # Se houver erro, não calcular duração
-                        pass
-            except Exception as e:
-                print(f"🔍 DEBUG: Erro ao processar datas: {e}")
-                # Se houver erro, tentar converter de forma mais simples
+                        last_error = e
+                        continue
+                if df is not None and len(df.columns) > 0:
+                    break
+
+            if df is None or len(df.columns) == 0:
+                raise ValueError(f"Não foi possível ler o CSV com nenhum encoding/formato. Último erro: {last_error}")
+        except Exception as fallback_error:
+            print(f"❌ DEBUG: Fallback falhou: {fallback_error}")
+            raise ValueError(f"Erro ao processar CSV: {primary_error}. Fallback também falhou: {fallback_error}")
+
+    # Processar datas conforme função original - com verificação de colunas
+    if 'Abertura' in df.columns:
+        df['Abertura']   = pd.to_datetime(df['Abertura'],   format="%d/%m/%Y %H:%M:%S", errors='coerce')
+    if 'Fechamento' in df.columns:
+        df['Fechamento'] = pd.to_datetime(df['Fechamento'], format="%d/%m/%Y %H:%M:%S", errors='coerce')
+
+    # Usar função de limpeza para valores numéricos
+    numeric_columns = ['Res. Operação', 'Res. Operação (%)', 'Preço Compra', 'Preço Venda',
+                      'Preço de Mercado', 'Médio', 'Res. Intervalo', 'Res. Intervalo (%)',
+                      'Res. Intervalo Bruto', 'Res. Intervalo Bruto (%)',
+                      'Drawdown', 'Ganho Max.', 'Perda Max.', 'Qtd Compra', 'Qtd Venda', 'Total']
+
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = df[col].apply(clean_numeric_value)
+
+    # Renomear colunas para padronizar
+    column_mapping = {
+        'Ativo': 'symbol',
+        'Abertura': 'entry_date',
+        'Fechamento': 'exit_date',
+        'Tempo Operação': 'duration_str',
+        'Qtd Compra': 'qty_buy',
+        'Qtd Venda': 'qty_sell',
+        'Lado': 'direction',
+        'Preço Compra': 'entry_price',
+        'Preço Venda': 'exit_price',
+        'Preço de Mercado': 'market_price',
+        'Médio': 'avg_price',
+        'Res. Intervalo': 'pnl',
+        'Res. Intervalo (%)': 'pnl_pct',
+        'Res. Intervalo Bruto': 'pnl',
+        'Res. Intervalo Bruto (%)': 'pnl_pct',
+        'Número Operação': 'trade_number',
+        'Res. Operação': 'operation_result',
+        'Res. Operação (%)': 'operation_result_pct',
+        'Drawdown': 'drawdown',
+        'Ganho Max.': 'max_gain',
+        'Perda Max.': 'max_loss',
+        'TET': 'tet',
+        'Total': 'total'
+    }
+
+    df = df.rename(columns=column_mapping)
+
+    if 'direction' in df.columns:
+        df['direction'] = df['direction'].map({'C': 'long', 'V': 'short'}).fillna('long')
+
+    if 'pnl' not in df.columns and 'operation_result' in df.columns:
+        df['pnl'] = df['operation_result']
+    if 'pnl' in df.columns:
+        df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
+
+    if 'entry_date' in df.columns and 'exit_date' in df.columns:
+        try:
+            if hasattr(df['entry_date'], 'dtype') and df['entry_date'].dtype == 'object':
+                df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
+            if hasattr(df['exit_date'], 'dtype') and df['exit_date'].dtype == 'object':
+                df['exit_date'] = pd.to_datetime(df['exit_date'], errors='coerce')
+
+            valid_dates = df['entry_date'].notna() & df['exit_date'].notna()
+            if valid_dates.any():
                 try:
-                    df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
-                    df['exit_date'] = pd.to_datetime(df['exit_date'], errors='coerce')
-                except:
-                    pass
-        
-        print(f"🔍 DEBUG: DataFrame final, shape: {df.shape}")
-        print(f"🔍 DEBUG: Colunas finais: {df.columns.tolist()}")
-        return df
-                
-    except Exception as e:
-        print(f"🔍 DEBUG: Erro em carregar_csv_safe: {e}")
-        raise ValueError(f"Erro ao processar CSV: {e}")
+                    duration_series = (df.loc[valid_dates, 'exit_date'] - df.loc[valid_dates, 'entry_date'])
+                    df.loc[valid_dates, 'duration_hours'] = duration_series.dt.total_seconds() / 3600
+                except Exception as e:
+                    print(f"🔍 DEBUG: Erro ao calcular duração: {e}")
+        except Exception as e:
+            print(f"🔍 DEBUG: Erro ao processar datas: {e}")
+            try:
+                df['entry_date'] = pd.to_datetime(df['entry_date'], errors='coerce')
+                df['exit_date'] = pd.to_datetime(df['exit_date'], errors='coerce')
+            except Exception:
+                pass
+
+    print(f"🔍 DEBUG: DataFrame final, shape: {df.shape}")
+    print(f"🔍 DEBUG: Colunas finais: {df.columns.tolist()}")
+    return df
 
 def processar_trades(df: pd.DataFrame, arquivo_para_indices: Dict[int, str] = None) -> List[Dict]:
     """Converte DataFrame em lista de trades para o frontend
@@ -465,9 +572,36 @@ def processar_trades(df: pd.DataFrame, arquivo_para_indices: Dict[int, str] = No
 
         # Determinar a estratégia baseada no arquivo de origem (se disponível)
         strategy = "Manual"
+        filename = None
         if arquivo_para_indices and idx in arquivo_para_indices:
             filename = arquivo_para_indices[idx]
-            strategy = filename.replace('.csv', '').replace('.CSV', '')
+        elif 'source_file' in df.columns:
+            filename = row.get('source_file')
+
+        if filename:
+            filename_str = str(filename)
+            strategy = Path(filename_str).stem
+
+        qty_buy_raw = row.get('qty_buy', 0)
+        qty_sell_raw = row.get('qty_sell', 0)
+
+        qty_buy = int(qty_buy_raw) if pd.notna(qty_buy_raw) else 0
+        qty_sell = int(qty_sell_raw) if pd.notna(qty_sell_raw) else 0
+        # Somar buy/sell; se ambos 0, tentar usar outras colunas
+        quantity_total = qty_buy + qty_sell
+        if quantity_total == 0:
+            for fallback in ('quantity', 'contracts', 'position', 'Position', 'Qtd', 'Qtd Total'):
+                if fallback in row.index and pd.notna(row[fallback]):
+                    try:
+                        quantity_total = int(float(row[fallback]))
+                        break
+                    except (ValueError, TypeError):
+                        continue
+        if quantity_total == 0 and 'qty' in row.index and pd.notna(row['qty']):
+            try:
+                quantity_total = int(float(row['qty']))
+            except (ValueError, TypeError):
+                quantity_total = 0
 
         trade = {
             "entry_date": entry_date.isoformat() if pd.notna(entry_date) else None,
@@ -479,9 +613,10 @@ def processar_trades(df: pd.DataFrame, arquivo_para_indices: Dict[int, str] = No
             "direction": row.get('direction', 'long'),
             "symbol": str(row.get('symbol', 'N/A')),
             "strategy": strategy,
-            "quantity_total": int(row.get('qty_buy')) + int(row.get('qty_sell')) if pd.notna(row.get('qty_buy')) and pd.notna(row.get('qty_sell')) else 0,
-            "quantity_compra": int(row.get('qty_buy', 0)) if pd.notna(row.get('qty_buy')) else 0,
-            "quantity_venda": int(row.get('qty_sell', 0)) if pd.notna(row.get('qty_sell')) else 0,
+            "source_file": filename,
+            "quantity_total": quantity_total,
+            "quantity_compra": qty_buy,
+            "quantity_venda": qty_sell,
             "duration": float(row.get('duration_hours', 0)) if pd.notna(row.get('duration_hours')) else 0,
             "drawdown": float(row.get('drawdown', 0)) if pd.notna(row.get('drawdown')) else 0,
             "max_gain": float(row.get('max_gain', 0)) if pd.notna(row.get('max_gain')) else 0,
@@ -547,8 +682,8 @@ def make_json_serializable(obj):
     elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
-        # Tratar valores infinitos
-        if np.isinf(obj):
+        # Tratar valores especiais
+        if np.isnan(obj) or np.isinf(obj):
             return None  # Retornar None em vez de Infinity
         return float(obj)
     elif isinstance(obj, np.ndarray):
@@ -562,12 +697,12 @@ def make_json_serializable(obj):
     elif hasattr(obj, 'item'):  # Para outros tipos numpy que têm método item()
         item_value = obj.item()
         # Tratar valores infinitos também aqui
-        if isinstance(item_value, float) and np.isinf(item_value):
+        if isinstance(item_value, float) and (np.isnan(item_value) or np.isinf(item_value)):
             return None
         return item_value
     elif isinstance(obj, float):
-        # Tratar valores infinitos para floats Python também
-        if np.isinf(obj):
+        # Tratar valores especiais para floats Python também
+        if np.isnan(obj) or np.isinf(obj):
             return None
         return obj
     else:
@@ -1082,9 +1217,20 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
     data_col = None
     quantidade_col = None
     
-    for col_name in ['operation_result', 'pnl', 'resultado']:
+    column_candidates = [
+        'operation_result', 'pnl', 'resultado',
+        'Res. Operação', 'Res. Operacao', 'Res. Operação Bruta',
+        'Res. Intervalo', 'Res. Intervalo Bruto', 'Total'
+    ]
+
+    for col_name in column_candidates:
         if col_name in df.columns:
-            resultado_col = col_name
+            if col_name not in ['operation_result', 'pnl', 'resultado']:
+                tmp_col = f"_resultado_tmp_{col_name}"
+                df[tmp_col] = pd.to_numeric(df[col_name], errors='coerce')
+                resultado_col = tmp_col
+            else:
+                resultado_col = col_name
             break
     
     for col_name in ['entry_date', 'data_abertura', 'data']:
@@ -1447,7 +1593,7 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
     resumo["maior_sequencia_perdas"] = probabilidade_furia_resultado["maior_sequencia_perdas"]
     
     # ===== RESULTADO FINAL =====
-    return {
+    resultado_final = {
         "disciplina_operacao": disciplina_operacao,
         "disciplina_dia": disciplina_dia,
         "disciplina_alavancagem": disciplina_alavancagem,
@@ -1461,10 +1607,10 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
             "dias_breakeven": dias_breakeven,
             "operacoes_ganhadoras": total_operacoes - disciplina_operacao["operacoes_perdedoras"],
             "operacoes_perdedoras": disciplina_operacao["operacoes_perdedoras"],
-            "pior_operacao": round(pior_operacao, 2),
-            "melhor_operacao": round(melhor_operacao, 2),
-            "pior_dia": round(pior_dia, 2),
-            "melhor_dia": round(melhor_dia, 2),
+            "pior_operacao": round(pior_operacao, 2) if total_operacoes > 0 else 0.0,
+            "melhor_operacao": round(melhor_operacao, 2) if total_operacoes > 0 else 0.0,
+            "pior_dia": round(pior_dia, 2) if total_dias > 0 else 0.0,
+            "melhor_dia": round(melhor_dia, 2) if total_dias > 0 else 0.0,
             "media_trades_por_dia": round(total_operacoes / total_dias, 1),
             "fator_disciplina_usado": float(fator_disciplina),
             "multiplicador_furia_usado": float(multiplicador_furia),
@@ -1484,6 +1630,12 @@ def calcular_disciplina_completa(df: pd.DataFrame, fator_disciplina: float = 0.2
             for _, row in resultado_diario.iterrows()
         ]
     }
+
+    for colname in list(df.columns):
+        if str(colname).startswith("_resultado_tmp_") or str(colname).startswith("_data_tmp_"):
+            df.drop(columns=[colname], inplace=True, errors='ignore')
+
+    return resultado_final
 
 # ============ API ÚNICA SIMPLIFICADA PARA MÚLTIPLOS ARQUIVOS ============
 
@@ -1630,6 +1782,12 @@ def api_tabela_multipla():
         if not dataframes:
             return jsonify({"error": "Nenhum arquivo enviado. Use 'file' para um arquivo ou 'files' para múltiplos"}), 400
         
+        # Aplicar filtros opcionais
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df = aplicar_filtros_basicos(df, filtros)
+            df = df.reset_index(drop=True)
+
         # Parâmetros opcionais
         capital_inicial = float(request.form.get('capital_inicial', 100000))
         cdi = float(request.form.get('cdi', 0.12))
@@ -1678,6 +1836,15 @@ def api_tabela_multipla():
                         resultado_individual['monthly'] = resultado_individual['Monthly Analysis']
                     if 'Equity Curve Data' in resultado_individual:
                         resultado_individual['equity_curve_data'] = resultado_individual['Equity Curve Data']
+                    if 'Position Sizing' in resultado_individual:
+                        resultado_individual['position_sizing'] = resultado_individual['Position Sizing']
+                        resultado_individual['positionSizing'] = resultado_individual['Position Sizing']
+                    if 'Trade Duration' in resultado_individual:
+                        resultado_individual['trade_duration'] = resultado_individual['Trade Duration']
+                        resultado_individual['tradeDuration'] = resultado_individual['Trade Duration']
+                    if 'Operational Costs' in resultado_individual:
+                        resultado_individual['operational_costs'] = resultado_individual['Operational Costs']
+                        resultado_individual['operationalCosts'] = resultado_individual['Operational Costs']
                 except Exception as e:
                     print(f"⚠️ DEBUG: Falha ao padronizar chaves camelCase: {e}")
                 
@@ -1730,6 +1897,15 @@ def api_tabela_multipla():
                 resultado_consolidado['monthly'] = resultado_consolidado['Monthly Analysis']
             if 'Equity Curve Data' in resultado_consolidado:
                 resultado_consolidado['equity_curve_data'] = resultado_consolidado['Equity Curve Data']
+            if 'Position Sizing' in resultado_consolidado:
+                resultado_consolidado['position_sizing'] = resultado_consolidado['Position Sizing']
+                resultado_consolidado['positionSizing'] = resultado_consolidado['Position Sizing']
+            if 'Trade Duration' in resultado_consolidado:
+                resultado_consolidado['trade_duration'] = resultado_consolidado['Trade Duration']
+                resultado_consolidado['tradeDuration'] = resultado_consolidado['Trade Duration']
+            if 'Operational Costs' in resultado_consolidado:
+                resultado_consolidado['operational_costs'] = resultado_consolidado['Operational Costs']
+                resultado_consolidado['operationalCosts'] = resultado_consolidado['Operational Costs']
         except Exception as e:
             print(f"⚠️ DEBUG: Falha ao padronizar chaves no consolidado: {e}")
         if 'equity_curve_data' not in resultado_consolidado:
@@ -1942,6 +2118,17 @@ def api_tabela():
             print(f"🔍 DEBUG: Performance Metrics: {resultado['Performance Metrics']}")
         else:
             print("🔍 DEBUG: Performance Metrics não encontrado")
+
+        # Padronizar chaves adicionais
+        if 'Position Sizing' in resultado:
+            resultado['position_sizing'] = resultado['Position Sizing']
+            resultado['positionSizing'] = resultado['Position Sizing']
+        if 'Trade Duration' in resultado:
+            resultado['trade_duration'] = resultado['Trade Duration']
+            resultado['tradeDuration'] = resultado['Trade Duration']
+        if 'Operational Costs' in resultado:
+            resultado['operational_costs'] = resultado['Operational Costs']
+            resultado['operationalCosts'] = resultado['Operational Costs']
         
         # Verificar se equity_curve_data existe, se não, gerar
         if 'equity_curve_data' not in resultado:
@@ -2023,12 +2210,23 @@ def api_backtest_completo():
         
         # Usar a função completa
         resultado = processar_backtest_completo(df, capital_inicial=capital_inicial, cdi=cdi)
+
+        if 'Position Sizing' in resultado:
+            resultado['position_sizing'] = resultado['Position Sizing']
+            resultado['positionSizing'] = resultado['Position Sizing']
+        if 'Trade Duration' in resultado:
+            resultado['trade_duration'] = resultado['Trade Duration']
+            resultado['tradeDuration'] = resultado['Trade Duration']
+        if 'Operational Costs' in resultado:
+            resultado['operational_costs'] = resultado['Operational Costs']
+            resultado['operationalCosts'] = resultado['Operational Costs']
         
         # Adicionar metadados úteis
         resultado["metadata"] = {
             "total_trades": len(df),
             "capital_inicial": capital_inicial,
             "cdi": cdi,
+            "filters": filtros,
             "periodo": {
                 "inicio": df['entry_date'].min().isoformat() if not df.empty and 'entry_date' in df.columns else None,
                 "fim": df['entry_date'].max().isoformat() if not df.empty and 'entry_date' in df.columns else None
@@ -2144,22 +2342,17 @@ def api_trades():
         
         # Lista para armazenar todos os DataFrames
         dataframes = []
-        arquivos_processados = []
-        arquivo_para_indices = {}  # Mapeamento de índice para nome do arquivo
-        current_index = 0
+        arquivos_processados: List[str] = []
+        filtros = _parse_filters_from_request(request)
         
         # Verificar se tem arquivo único
         if 'file' in request.files:
             arquivo = request.files['file']
             if arquivo.filename != '':
                 df = carregar_csv_trades(arquivo)
+                df['source_file'] = arquivo.filename
                 dataframes.append(df)
                 arquivos_processados.append(arquivo.filename)
-                
-                # Mapear índices para este arquivo
-                for i in range(len(df)):
-                    arquivo_para_indices[current_index + i] = arquivo.filename
-                current_index += len(df)
         
         # Verificar se tem múltiplos arquivos
         if 'files' in request.files:
@@ -2167,13 +2360,9 @@ def api_trades():
             for arquivo in arquivos:
                 if arquivo.filename != '':
                     df = carregar_csv_trades(arquivo)
+                    df['source_file'] = arquivo.filename
                     dataframes.append(df)
                     arquivos_processados.append(arquivo.filename)
-                    
-                    # Mapear índices para este arquivo
-                    for i in range(len(df)):
-                        arquivo_para_indices[current_index + i] = arquivo.filename
-                    current_index += len(df)
         
         # Verificar se tem caminho de arquivo
         if 'path' in request.form:
@@ -2181,13 +2370,9 @@ def api_trades():
             if not os.path.exists(path):
                 return jsonify({"error": "Arquivo não encontrado"}), 404
             df = carregar_csv_trades(path)
+            df['source_file'] = os.path.basename(path)
             dataframes.append(df)
             arquivos_processados.append(os.path.basename(path))
-            
-            # Mapear índices para este arquivo
-            for i in range(len(df)):
-                arquivo_para_indices[current_index + i] = os.path.basename(path)
-            current_index += len(df)
         
         # Se não tem nenhum arquivo
         if not dataframes:
@@ -2195,6 +2380,18 @@ def api_trades():
         
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
+
+        if filtros:
+            df_consolidado = aplicar_filtros_basicos(df_consolidado, filtros)
+
+        df_consolidado = df_consolidado.reset_index(drop=True)
+
+        arquivo_para_indices = {}
+        if 'source_file' in df_consolidado.columns:
+            arquivo_para_indices = {
+                idx: df_consolidado.at[idx, 'source_file']
+                for idx in df_consolidado.index
+            }
         
         # Processar dados consolidados com mapeamento de arquivos
         trades = processar_trades(df_consolidado, arquivo_para_indices)
@@ -2208,6 +2405,15 @@ def api_trades():
         # Extrair estratégias únicas dos trades processados
         available_strategies = sorted(list(set([trade['strategy'] for trade in trades if trade['strategy']])))
 
+        trades_por_arquivo = {}
+        if 'source_file' in df_consolidado.columns:
+            trades_por_arquivo = (
+                df_consolidado['source_file']
+                .fillna('Desconhecido')
+                .value_counts()
+                .to_dict()
+            )
+
         resultado = {
             "trades": trades,
             "statistics": {
@@ -2218,7 +2424,8 @@ def api_trades():
             },
             "filters": {
                 "available_assets": available_assets,
-                "available_strategies": available_strategies
+                "available_strategies": available_strategies,
+                "current": filtros
             },
             "metadata": {
                 "total_records": len(df_consolidado),
@@ -2230,6 +2437,7 @@ def api_trades():
                 "info_arquivos": {
                     "total_arquivos": len(arquivos_processados),
                     "nomes_arquivos": arquivos_processados,
+                    "trades_por_arquivo": trades_por_arquivo,
                     "total_registros_consolidados": len(df_consolidado)
                 }
             }
@@ -2254,6 +2462,10 @@ def api_trades_summary():
         else:
             return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
 
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df = aplicar_filtros_basicos(df, filtros).reset_index(drop=True)
+
         # Calcular apenas estatísticas essenciais
         estatisticas_gerais = calcular_estatisticas_gerais(df)
         custos = calcular_custos_operacionais(df)
@@ -2261,7 +2473,8 @@ def api_trades_summary():
         resultado = {
             "summary": estatisticas_gerais,
             "costs": custos,
-            "total_records": len(df)
+            "total_records": len(df),
+            "filters": filtros
         }
 
         return jsonify(make_json_serializable(resultado))
@@ -2285,6 +2498,10 @@ def api_daily_metrics():
             df = carregar_csv_trades(path)
         else:
             return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
+
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df = aplicar_filtros_basicos(df, filtros).reset_index(drop=True)
 
         # Parâmetros opcionais
         capital_inicial = float(request.form.get('capital_inicial', 100000))
@@ -2340,7 +2557,9 @@ def api_daily_metrics():
         
         if not metricas:
             return jsonify({"error": "Não foi possível calcular métricas"}), 400
-        
+
+        metricas["filters"] = filtros
+
         return jsonify(make_json_serializable(metricas))
 
     except Exception as e:
@@ -2875,22 +3094,30 @@ def calcular_drawdown_padronizado(df: pd.DataFrame) -> Dict[str, float]:
             "capital_inicial": 0.0
         }
     
-    # Calcular equity curve trade por trade (PADRONIZADO)
-    df_valid['equity'] = df_valid['pnl'].cumsum()
-    df_valid['peak'] = df_valid['equity'].cummax()
-    df_valid['drawdown'] = df_valid['equity'] - df_valid['peak']
+    # Calcular equity curve trade por trade com baseline zero (padronizado)
+    pnl_series = df_valid['pnl'].fillna(0).astype(float)
+    equity = pnl_series.cumsum()
+    equity_with_start = pd.concat([pd.Series([0.0]), equity], ignore_index=True)
+    peak = equity_with_start.cummax()
+    drawdown = equity_with_start - peak
+    
+    # Remover o ponto inicial artificial para análises
+    equity = equity_with_start.iloc[1:]
+    peak = peak.iloc[1:]
+    drawdown = drawdown.iloc[1:]
     
     # Drawdown máximo (valor positivo)
-    max_drawdown = abs(df_valid['drawdown'].min()) if not df_valid['drawdown'].empty else 0.0
+    max_drawdown = float(abs(drawdown.min())) if not drawdown.empty else 0.0
     
     # Saldo final
-    saldo_final = df_valid['equity'].iloc[-1] if not df_valid['equity'].empty else 0.0
+    saldo_final = float(equity.iloc[-1]) if not equity.empty else 0.0
     
-    # Capital inicial estimado (baseado no pico máximo)
-    capital_inicial = df_valid['peak'].max() if not df_valid['peak'].empty else 0.0
+    # Capital inicial estimado: maior pico observado (considerando baseline 0)
+    peak_max = float(peak.max()) if not peak.empty else 0.0
+    capital_inicial = peak_max if peak_max > 0 else max_drawdown
     
     # Percentual do drawdown (baseado no capital inicial)
-    max_drawdown_pct = (max_drawdown / capital_inicial * 100) if capital_inicial != 0 else 0.0
+    max_drawdown_pct = (max_drawdown / capital_inicial * 100) if capital_inicial not in (0, np.nan) else 0.0
     
     # Logs de debug
     print(f"🔍 DEBUG - Drawdown Padronizado:")
