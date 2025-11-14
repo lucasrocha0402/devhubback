@@ -264,12 +264,17 @@ _DIRECTION_MAP = {
 
 
 def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.DataFrame:
-    """Aplica filtros padrão (como direção) ao DataFrame."""
+    """Aplica filtros padrão (direção, ativo, estratégia, datas, etc.) ao DataFrame."""
     if df.empty or not filtros:
+        print(f"🔍 aplicar_filtros_basicos: DataFrame vazio ou sem filtros. Shape: {df.shape}, Filtros: {filtros}")
         return df
 
     df_filtrado = df.copy()
+    filtros_aplicados = []
+    
+    print(f"🔍 aplicar_filtros_basicos: Aplicando filtros. Shape antes: {df_filtrado.shape}, Filtros recebidos: {filtros}")
 
+    # FILTRO 1: Direção (direction, direcao, side)
     direction_filter = (
         filtros.get('direction')
         or filtros.get('directions')
@@ -278,60 +283,180 @@ def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.Dat
     )
 
     if direction_filter:
+        print(f"   🔍 Filtrando por direção: {direction_filter}")
         direction_col = None
-        for candidate in ('direction', 'Lado', 'lado'):
+        
+        # Procurar coluna de direção em várias variações
+        for candidate in ('direction', 'Lado', 'lado', 'Direção', 'direcao', 'Side'):
             if candidate in df_filtrado.columns:
                 direction_col = candidate
                 break
-
+        
+        # Se não encontrou, tentar criar a partir de colunas normalizadas
         if direction_col is None:
-            return df_filtrado
+            # Verificar se tem coluna normalizada
+            if 'direction' not in df_filtrado.columns:
+                print(f"   ⚠️ Coluna de direção não encontrada. Colunas disponíveis: {list(df_filtrado.columns)[:10]}")
+                # Tentar criar a partir de 'Lado' se existir
+                if 'Lado' in df_filtrado.columns:
+                    df_filtrado['direction'] = df_filtrado['Lado'].astype(str).str.strip().str.upper().map({
+                        'C': 'long', 'COMPRA': 'long', 'COMPRADO': 'long',
+                        'V': 'short', 'VENDA': 'short', 'VENDIDO': 'short'
+                    }).fillna('long')
+                    direction_col = 'direction'
+                else:
+                    print(f"   ⚠️ Não foi possível aplicar filtro de direção. Continuando sem filtrar por direção.")
+            else:
+                direction_col = 'direction'
 
-        direction_series = df_filtrado[direction_col].astype(str).str.strip()
-        mapped_direction = direction_series.str.lower().map({
-            'c': 'long',
-            'compra': 'long',
-            'comprado': 'long',
-            'v': 'short',
-            'venda': 'short',
-            'vendido': 'short'
-        })
-
-        if direction_col != 'direction':
+        if direction_col:
+            direction_series = df_filtrado[direction_col].astype(str).str.strip()
+            mapped_direction = direction_series.str.upper().map({
+                'C': 'long', 'COMPRA': 'long', 'COMPRADO': 'long', 'LONG': 'long', 'BUY': 'long',
+                'V': 'short', 'VENDA': 'short', 'VENDIDO': 'short', 'SHORT': 'short', 'SELL': 'short'
+            })
+            
+            # Se algum valor não foi mapeado, tentar lowercase
+            if mapped_direction.isna().any():
+                mapped_direction = mapped_direction.fillna(
+                    direction_series.str.lower().map({
+                        'c': 'long', 'compra': 'long', 'comprado': 'long', 'long': 'long', 'buy': 'long',
+                        'v': 'short', 'venda': 'short', 'vendido': 'short', 'short': 'short', 'sell': 'short'
+                    })
+                )
+            
             df_filtrado['_direction_tmp_'] = mapped_direction.fillna(direction_series.str.lower())
             direction_column_to_use = '_direction_tmp_'
-        else:
-            df_filtrado['_direction_tmp_'] = direction_series.str.lower()
-            direction_column_to_use = '_direction_tmp_'
 
-        if isinstance(direction_filter, (list, tuple, set)):
-            requested = list(direction_filter)
-        else:
-            requested = [direction_filter]
-
-        allowed = set()
-        for item in requested:
-            if item is None:
-                continue
-            normalized = str(item).strip().lower()
-            if normalized in _DIRECTION_MAP:
-                mapped = _DIRECTION_MAP[normalized]
-                if not mapped:  # represents 'all'
-                    allowed = set()
-                    break
-                allowed.update(mapped)
+            if isinstance(direction_filter, (list, tuple, set)):
+                requested = [str(x).strip().lower() for x in direction_filter if x is not None]
             else:
-                # tentar correspondência parcial (ex.: 'compra' dentro de 'compra (long)')
-                if 'compra' in normalized:
-                    allowed.update(_DIRECTION_MAP['compra'])
-                elif 'venda' in normalized:
-                    allowed.update(_DIRECTION_MAP['venda'])
+                requested = [str(direction_filter).strip().lower()] if direction_filter else []
 
-        if allowed:
-            df_filtrado = df_filtrado[df_filtrado[direction_column_to_use].isin(allowed)]
+            allowed = set()
+            for item in requested:
+                if not item:
+                    continue
+                normalized = item.lower()
+                if normalized in _DIRECTION_MAP:
+                    mapped = _DIRECTION_MAP[normalized]
+                    if not mapped:  # represents 'all'
+                        allowed = set()
+                        break
+                    allowed.update(mapped)
+                else:
+                    # tentar correspondência parcial
+                    if 'compra' in normalized or 'buy' in normalized or 'long' in normalized:
+                        allowed.update(_DIRECTION_MAP.get('compra', {'long'}))
+                    elif 'venda' in normalized or 'sell' in normalized or 'short' in normalized:
+                        allowed.update(_DIRECTION_MAP.get('venda', {'short'}))
 
-        df_filtrado = df_filtrado.drop(columns=['_direction_tmp_'], errors='ignore')
+            if allowed:
+                antes = len(df_filtrado)
+                df_filtrado = df_filtrado[df_filtrado[direction_column_to_use].isin(allowed)]
+                depois = len(df_filtrado)
+                print(f"   ✅ Filtro de direção aplicado: {antes} -> {depois} registros (filtro: {allowed})")
+                filtros_aplicados.append(f"direção: {allowed}")
 
+            df_filtrado = df_filtrado.drop(columns=['_direction_tmp_'], errors='ignore')
+
+    # FILTRO 2: Ativo/Símbolo (asset, symbol, ativo, simbolo)
+    asset_filter = (
+        filtros.get('asset')
+        or filtros.get('symbol')
+        or filtros.get('ativo')
+        or filtros.get('simbolo')
+    )
+    
+    if asset_filter and not df_filtrado.empty:
+        print(f"   🔍 Filtrando por ativo: {asset_filter}")
+        asset_col = None
+        for candidate in ('symbol', 'Ativo', 'ativo', 'asset', 'Asset', 'SYMBOL'):
+            if candidate in df_filtrado.columns:
+                asset_col = candidate
+                break
+        
+        if asset_col:
+            if isinstance(asset_filter, (list, tuple, set)):
+                allowed_assets = [str(x).strip() for x in asset_filter if x]
+            else:
+                allowed_assets = [str(asset_filter).strip()] if asset_filter else []
+            
+            if allowed_assets:
+                antes = len(df_filtrado)
+                # Busca case-insensitive
+                mask = df_filtrado[asset_col].astype(str).str.strip().str.upper().isin(
+                    [a.upper() for a in allowed_assets]
+                )
+                df_filtrado = df_filtrado[mask]
+                depois = len(df_filtrado)
+                print(f"   ✅ Filtro de ativo aplicado: {antes} -> {depois} registros (ativos: {allowed_assets})")
+                filtros_aplicados.append(f"ativo: {allowed_assets}")
+        else:
+            print(f"   ⚠️ Coluna de ativo não encontrada. Colunas disponíveis: {list(df_filtrado.columns)[:10]}")
+
+    # FILTRO 3: Estratégia (strategy, estrategia, Estratégia)
+    strategy_filter = (
+        filtros.get('strategy')
+        or filtros.get('estrategia')
+        or filtros.get('Estratégia')
+    )
+    
+    if strategy_filter and not df_filtrado.empty:
+        print(f"   🔍 Filtrando por estratégia: {strategy_filter}")
+        strategy_col = None
+        for candidate in ('strategy', 'Estratégia', 'estrategia', 'Strategy', 'STRATEGY'):
+            if candidate in df_filtrado.columns:
+                strategy_col = candidate
+                break
+        
+        if strategy_col:
+            if isinstance(strategy_filter, (list, tuple, set)):
+                allowed_strategies = [str(x).strip() for x in strategy_filter if x]
+            else:
+                allowed_strategies = [str(strategy_filter).strip()] if strategy_filter else []
+            
+            if allowed_strategies:
+                antes = len(df_filtrado)
+                # Busca case-insensitive
+                mask = df_filtrado[strategy_col].astype(str).str.strip().isin(allowed_strategies)
+                df_filtrado = df_filtrado[mask]
+                depois = len(df_filtrado)
+                print(f"   ✅ Filtro de estratégia aplicado: {antes} -> {depois} registros (estratégias: {allowed_strategies})")
+                filtros_aplicados.append(f"estratégia: {allowed_strategies}")
+        else:
+            print(f"   ⚠️ Coluna de estratégia não encontrada. Colunas disponíveis: {list(df_filtrado.columns)[:10]}")
+
+    # FILTRO 4: Período de datas (date_from, date_to, data_inicio, data_fim)
+    if 'entry_date' in df_filtrado.columns and not df_filtrado.empty:
+        date_from = filtros.get('date_from') or filtros.get('data_inicio') or filtros.get('date_start')
+        date_to = filtros.get('date_to') or filtros.get('data_fim') or filtros.get('date_end')
+        
+        if date_from or date_to:
+            print(f"   🔍 Filtrando por período: {date_from} até {date_to}")
+            try:
+                df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                antes = len(df_filtrado)
+                
+                if date_from:
+                    date_from_dt = pd.to_datetime(date_from, errors='coerce')
+                    if pd.notna(date_from_dt):
+                        df_filtrado = df_filtrado[df_filtrado['entry_date'] >= date_from_dt]
+                
+                if date_to:
+                    date_to_dt = pd.to_datetime(date_to, errors='coerce')
+                    if pd.notna(date_to_dt):
+                        df_filtrado = df_filtrado[df_filtrado['entry_date'] <= date_to_dt]
+                
+                depois = len(df_filtrado)
+                print(f"   ✅ Filtro de data aplicado: {antes} -> {depois} registros")
+                filtros_aplicados.append(f"período: {date_from} até {date_to}")
+            except Exception as e:
+                print(f"   ⚠️ Erro ao aplicar filtro de data: {e}")
+
+    print(f"✅ aplicar_filtros_basicos: Filtros aplicados: {filtros_aplicados if filtros_aplicados else 'nenhum'}")
+    print(f"   Shape final: {df_filtrado.shape} (antes: {df.shape})")
+    
     return df_filtrado
 
 def carregar_csv_trades(file_path_or_file):
@@ -413,12 +538,33 @@ def carregar_csv_trades(file_path_or_file):
 
 # Função carregar_csv_safe melhorada com encoding robusto
 def carregar_csv_safe(file_path_or_file):
-    """Função auxiliar para carregar CSV com encoding seguro baseada na função original"""
+    """
+    CORRIGIDO: Função auxiliar para carregar CSV com encoding seguro e suporte a múltiplos tipos de arquivo.
+    Agora suporta CSV, Excel (.xlsx, .xls) e JSON, além de validar campos obrigatórios.
+    """
     try:
-        # Usar primeiro a rotina padronizada do FunCalculos (detecção automática de cabeçalho)
+        # Usar primeiro a rotina padronizada do FunCalculos (detecção automática de cabeçalho e múltiplos formatos)
         if hasattr(file_path_or_file, 'seek'):
             file_path_or_file.seek(0)
+        
+        # CORREÇÃO: Usar a função carregar_csv do FunCalculos que foi melhorada
         df = carregar_csv(file_path_or_file)
+        
+        # CORREÇÃO: Validar campos obrigatórios após carregar
+        if df.empty:
+            raise ValueError("O arquivo está vazio ou não contém dados válidos.")
+        
+        # Validar que há pelo menos uma coluna de data e uma de PnL
+        has_date_col = any(col in df.columns for col in ['entry_date', 'Abertura'])
+        has_pnl_col = any(col in df.columns for col in ['pnl', 'Res. Operação', 'Res. Intervalo', 'operation_result'])
+        
+        if not has_date_col:
+            raise ValueError("O arquivo não contém coluna de data (entry_date ou Abertura).")
+        
+        if not has_pnl_col:
+            raise ValueError("O arquivo não contém coluna de resultado (pnl, Res. Operação ou Res. Intervalo).")
+        
+        return df
     except Exception as primary_error:
         print(f"🔍 DEBUG: Fallback para leitura manual do CSV ({primary_error})")
         try:
@@ -549,10 +695,32 @@ def processar_trades(df: pd.DataFrame, arquivo_para_indices: Dict[int, str] = No
     print(f"🔍 Processando trades - DataFrame shape: {df.shape}")
     print(f"📅 Colunas disponíveis: {list(df.columns)}")
 
+    # CORREÇÃO CRÍTICA: Normalizar o DataFrame SEMPRE, mesmo se entry_date já existe
+    # Quando concatenamos DataFrames, um pode ter 'Abertura' e outro 'entry_date'
+    # A normalização garante que todos usem as mesmas colunas padronizadas
+    from FunCalculos import _normalize_trades_dataframe
+    
+    # Verificar se precisa normalizar (se tem colunas não normalizadas como 'Abertura' ou se entry_date está vazio)
+    needs_normalization = (
+        df.empty or 
+        'entry_date' not in df.columns or 
+        'pnl' not in df.columns or
+        ('Abertura' in df.columns and ('entry_date' not in df.columns or df['entry_date'].isna().all()))
+    )
+    
+    if needs_normalization:
+        print(f"🔄 Normalizando DataFrame em processar_trades...")
+        df = _normalize_trades_dataframe(df)
+        if df.empty:
+            print("⚠️ DataFrame vazio após normalização")
+            return trades
+        print(f"✅ DataFrame normalizado. entry_date válidos: {df['entry_date'].notna().sum() if 'entry_date' in df.columns else 0}/{len(df)}")
+
     # Verificar se a coluna mínima necessária existe
     required_columns = ['entry_date']
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
+        print(f"❌ Colunas faltando: {missing_columns}. Colunas disponíveis: {list(df.columns)}")
         return trades
 
     processed_count = 0
@@ -833,6 +1001,13 @@ def calcular_metricas_diarias(df: pd.DataFrame) -> Dict[str, Any]:
     if df.empty:
         return {}
     
+    # CORREÇÃO: Normalizar o DataFrame se necessário
+    from FunCalculos import _normalize_trades_dataframe
+    if 'entry_date' not in df.columns or 'pnl' not in df.columns:
+        df = _normalize_trades_dataframe(df)
+        if df.empty:
+            return {}
+    
     # Filtrar trades válidas
     df_valid = df.dropna(subset=['pnl', 'entry_date'])
     
@@ -874,6 +1049,16 @@ def calcular_metricas_diarias(df: pd.DataFrame) -> pd.DataFrame:
     print(f"🔍 DEBUG - calcular_metricas_diarias:")
     print(f"  Total de trades: {len(df)}")
     print(f"  Colunas disponíveis: {df.columns.tolist()}")
+    
+    # CORREÇÃO: Normalizar o DataFrame se necessário
+    from FunCalculos import _normalize_trades_dataframe
+    if 'entry_date' not in df.columns or 'pnl' not in df.columns:
+        print("  🔄 Normalizando DataFrame...")
+        df = _normalize_trades_dataframe(df)
+        if df.empty:
+            print("⚠️ DataFrame vazio após normalização")
+            return pd.DataFrame()
+        print(f"  ✅ DataFrame normalizado. Colunas: {df.columns.tolist()}")
     
     # Filtrar trades válidas e ordenar por data
     df_valid = df.dropna(subset=['pnl', 'entry_date']).copy()
@@ -961,6 +1146,13 @@ def calcular_metricas_principais(df: pd.DataFrame, taxa_juros_mensal: float = 0.
     if df.empty:
         return {}
     
+    # CORREÇÃO: Normalizar o DataFrame se necessário
+    from FunCalculos import _normalize_trades_dataframe
+    if 'entry_date' not in df.columns or 'pnl' not in df.columns:
+        df = _normalize_trades_dataframe(df)
+        if df.empty:
+            return {}
+    
     # Usar a função de métricas diárias corrigida
     daily_stats = calcular_metricas_diarias(df)
     
@@ -982,10 +1174,28 @@ def calcular_metricas_principais(df: pd.DataFrame, taxa_juros_mensal: float = 0.
     winning_trades = len(df_valid[df_valid['pnl'] > 0])
     losing_trades = len(df_valid[df_valid['pnl'] < 0])
     
-    # Payoff Ratio (Ganho médio / Perda média)
-    avg_win = df_valid[df_valid['pnl'] > 0]['pnl'].mean() if winning_trades > 0 else 0
-    avg_loss = abs(df_valid[df_valid['pnl'] < 0]['pnl'].mean()) if losing_trades > 0 else 0
-    payoff_ratio = avg_win / avg_loss if avg_loss != 0 else 0
+    # CORREÇÃO: Payoff Ratio (Ganho médio / Perda média) com validação
+    wins_pnl = df_valid[df_valid['pnl'] > 0]['pnl'].dropna()
+    losses_pnl = df_valid[df_valid['pnl'] < 0]['pnl'].dropna()
+    
+    avg_win = wins_pnl.mean() if len(wins_pnl) > 0 else 0.0
+    avg_loss = abs(losses_pnl.mean()) if len(losses_pnl) > 0 else 0.0
+    
+    # Garantir valores válidos
+    if pd.isna(avg_win) or np.isinf(avg_win):
+        avg_win = 0.0
+    if pd.isna(avg_loss) or np.isinf(avg_loss):
+        avg_loss = 0.0
+    
+    # Calcular payoff corretamente
+    if avg_loss > 0 and not pd.isna(avg_loss) and not np.isinf(avg_loss):
+        payoff_ratio = avg_win / avg_loss if not pd.isna(avg_win) and not np.isinf(avg_win) else 0.0
+    else:
+        payoff_ratio = 0.0
+    
+    # Garantir que payoff seja válido
+    if pd.isna(payoff_ratio) or np.isinf(payoff_ratio):
+        payoff_ratio = 0.0
     
     # PADRONIZADO: Usar função centralizada para calcular drawdown
     drawdown_data = calcular_drawdown_padronizado(df)
@@ -1086,7 +1296,7 @@ def calcular_metricas_principais(df: pd.DataFrame, taxa_juros_mensal: float = 0.
         "ganhos_perdas": {
             "ganho_medio_diario": round(daily_avg_win, 2),
             "perda_media_diaria": round(daily_avg_loss, 2),
-            "payoff_diario": round(daily_avg_win / daily_avg_loss if daily_avg_loss != 0 else 0, 2),
+            "payoff_diario": round(daily_avg_win / daily_avg_loss if daily_avg_loss > 0 and not pd.isna(daily_avg_loss) and not np.isinf(daily_avg_loss) and not pd.isna(daily_avg_win) and not np.isinf(daily_avg_win) else 0.0, 2),
             "ganho_maximo_diario": round(daily_max_win, 2),
             "perda_maxima_diaria": round(abs(daily_max_loss), 2)  # Valor absoluto para compatibilidade
         },
@@ -1687,6 +1897,14 @@ def api_disciplina_completa():
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
         
+        # CORREÇÃO: Normalizar o DataFrame consolidado antes de calcular disciplina
+        from FunCalculos import _normalize_trades_dataframe
+        if 'entry_date' not in df_consolidado.columns or 'pnl' not in df_consolidado.columns:
+            print(f"🔄 api_disciplina_completa: Normalizando DataFrame consolidado (shape: {df_consolidado.shape})...")
+            df_consolidado = _normalize_trades_dataframe(df_consolidado)
+            if df_consolidado.empty:
+                return jsonify({"error": "Após normalização, o arquivo ficou vazio. Verifique os dados."}), 400
+        
         # Calcular disciplina no DataFrame consolidado
         resultado = calcular_disciplina_completa(df_consolidado, fator_disciplina, multiplicador_furia)
         
@@ -1752,11 +1970,21 @@ def api_tabela_multipla():
         dataframes = []
         arquivos_processados = []
         
+        # CORREÇÃO CRÍTICA: Normalizar CADA DataFrame individualmente logo após carregar
+        # Isso garante que todos tenham entry_date e pnl ANTES de serem processados individualmente
+        from FunCalculos import _normalize_trades_dataframe
+        
         # Verificar se tem arquivo único
         if 'file' in request.files:
             arquivo = request.files['file']
             if arquivo.filename != '':
                 df = carregar_csv_safe(arquivo)
+                # Normalizar imediatamente após carregar
+                print(f"🔄 api_tabela_multipla: Normalizando arquivo único '{arquivo.filename}' após carregar...")
+                if 'entry_date' not in df.columns or 'pnl' not in df.columns or (hasattr(df, 'entry_date') and df['entry_date'].isna().all() if 'entry_date' in df.columns else False):
+                    df = _normalize_trades_dataframe(df)
+                    entry_date_valid = df['entry_date'].notna().sum() if 'entry_date' in df.columns else 0
+                    print(f"   ✅ Arquivo único normalizado: entry_date válidos: {entry_date_valid}/{len(df)}")
                 dataframes.append(df)
                 arquivos_processados.append(arquivo.filename)
         
@@ -1766,6 +1994,20 @@ def api_tabela_multipla():
             for arquivo in arquivos:
                 if arquivo.filename != '':
                     df = carregar_csv_safe(arquivo)
+                    # CORREÇÃO CRÍTICA: Normalizar imediatamente após carregar CADA arquivo
+                    print(f"🔄 api_tabela_multipla: Normalizando '{arquivo.filename}' após carregar...")
+                    needs_norm = 'entry_date' not in df.columns or 'pnl' not in df.columns
+                    if not needs_norm and 'entry_date' in df.columns:
+                        needs_norm = df['entry_date'].isna().all()
+                    if needs_norm:
+                        df_before = df.copy()
+                        df = _normalize_trades_dataframe(df)
+                        if df.empty:
+                            print(f"   ⚠️ Arquivo '{arquivo.filename}' ficou vazio após normalização (tinha {len(df_before)} linhas)")
+                        else:
+                            entry_date_valid = df['entry_date'].notna().sum() if 'entry_date' in df.columns else 0
+                            pnl_valid = df['pnl'].notna().sum() if 'pnl' in df.columns else 0
+                            print(f"   ✅ Arquivo normalizado: entry_date válidos: {entry_date_valid}/{len(df)}, pnl válidos: {pnl_valid}/{len(df)}")
                     dataframes.append(df)
                     arquivos_processados.append(arquivo.filename)
         
@@ -1775,6 +2017,10 @@ def api_tabela_multipla():
             if not os.path.exists(path):
                 return jsonify({"error": "Arquivo não encontrado"}), 404
             df = carregar_csv_safe(path)
+            # Normalizar imediatamente após carregar
+            print(f"🔄 api_tabela_multipla: Normalizando arquivo por path '{path}' após carregar...")
+            if 'entry_date' not in df.columns or 'pnl' not in df.columns or (hasattr(df, 'entry_date') and df['entry_date'].isna().all() if 'entry_date' in df.columns else False):
+                df = _normalize_trades_dataframe(df)
             dataframes.append(df)
             arquivos_processados.append(os.path.basename(path))
         
@@ -1792,6 +2038,30 @@ def api_tabela_multipla():
         capital_inicial = float(request.form.get('capital_inicial', 100000))
         cdi = float(request.form.get('cdi', 0.12))
         
+        # CORREÇÃO: Suporte para taxas customizadas de corretagem e emolumentos
+        # Permite que o frontend envie taxas customizadas que serão aplicadas nos cálculos
+        taxa_corretagem = request.form.get('taxa_corretagem') or request.form.get('backtest_commission')
+        taxa_emolumentos = request.form.get('taxa_emolumentos') or request.form.get('backtest_fees')
+        
+        # Se não foram fornecidas, usar None para que o backend use cálculo automático
+        if taxa_corretagem:
+            try:
+                taxa_corretagem = float(taxa_corretagem)
+                print(f"💼 Taxa de corretagem customizada recebida: R$ {taxa_corretagem:.2f} por roda")
+            except:
+                taxa_corretagem = None
+        else:
+            taxa_corretagem = None
+        
+        if taxa_emolumentos:
+            try:
+                taxa_emolumentos = float(taxa_emolumentos)
+                print(f"💼 Taxa de emolumentos customizada recebida: R$ {taxa_emolumentos:.2f} por roda")
+            except:
+                taxa_emolumentos = None
+        else:
+            taxa_emolumentos = None
+        
         # Processar cada arquivo individualmente
         resultados_individuais = {}
         print(f"🔍 Processando {len(dataframes)} arquivos individualmente:")
@@ -1801,31 +2071,187 @@ def api_tabela_multipla():
                 print(f"     📊 Registros: {len(df)}")
                 print(f"     📅 Colunas: {list(df.columns)}")
                 
-                # Garantir que 'pnl' exista antes de qualquer cálculo
+                # CORREÇÃO CRÍTICA: Normalizar o DataFrame SEMPRE, não apenas se faltar
+                # Isso garante que sempre tenhamos entry_date, pnl, etc. no formato correto
+                from FunCalculos import _normalize_trades_dataframe
                 try:
-                    if 'pnl' not in df.columns:
-                        if 'operation_result' in df.columns:
-                            df['pnl'] = df['operation_result']
-                        elif 'Res. Intervalo Bruto' in df.columns:
-                            df['pnl'] = pd.to_numeric(df['Res. Intervalo Bruto'], errors='coerce')
-                        elif 'Res. Intervalo' in df.columns:
-                            df['pnl'] = pd.to_numeric(df['Res. Intervalo'], errors='coerce')
-                    # Converter para numérico por segurança
-                    if 'pnl' in df.columns:
-                        df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
+                    print(f"     🔄 Normalizando DataFrame (shape antes: {df.shape})...")
+                    print(f"        Colunas antes: {list(df.columns)[:5]}...")  # Primeiras 5 colunas
+                    
+                    # SEMPRE normalizar, mesmo se as colunas já existem (para garantir formato correto)
+                    df_original_len = len(df)
+                    df = _normalize_trades_dataframe(df)
+                    
+                    if df.empty:
+                        print(f"     ⚠️ DataFrame vazio após normalização (tinha {df_original_len} linhas antes)")
+                        resultados_individuais[nome_arquivo] = {
+                            "error": f"Após normalização, o arquivo ficou vazio. Verifique se há valores válidos nas colunas 'Abertura' e de resultado (Res. Intervalo, Res. Operação, etc.).",
+                            "info_arquivo": {
+                                "nome_arquivo": nome_arquivo,
+                                "total_registros": df_original_len
+                            }
+                        }
+                        continue
+                    
+                    # Verificar se entry_date foi criado e tem valores válidos
+                    has_entry_date = 'entry_date' in df.columns
+                    has_pnl = 'pnl' in df.columns
+                    entry_date_valid = df['entry_date'].notna().sum() if has_entry_date else 0
+                    pnl_valid = df['pnl'].notna().sum() if has_pnl else 0
+                    
+                    print(f"     ✅ DataFrame normalizado (shape depois: {df.shape})")
+                    print(f"        entry_date existe: {has_entry_date}, válidos: {entry_date_valid}/{len(df)}")
+                    print(f"        pnl existe: {has_pnl}, válidos: {pnl_valid}/{len(df)}")
+                    print(f"        Colunas depois: {list(df.columns)}")
+                    
+                    # Se não tem entry_date válido, tentar diagnosticar
+                    if not has_entry_date or entry_date_valid == 0:
+                        print(f"     ⚠️ AVISO: entry_date não criado ou sem valores válidos!")
+                        if 'Abertura' in df.columns:
+                            print(f"        Coluna 'Abertura' existe. Primeiros valores:")
+                            print(f"        {df['Abertura'].head(3).tolist()}")
+                        else:
+                            print(f"        Coluna 'Abertura' NÃO existe. Colunas disponíveis: {list(df.columns)}")
+                    
                 except Exception as e:
-                    print(f"⚠️ DEBUG: Falha ao garantir 'pnl' antes do debug_drawdown: {e}")
+                    import traceback
+                    error_details = traceback.format_exc()
+                    print(f"     ❌ Erro ao normalizar DataFrame: {e}")
+                    print(f"     Detalhes: {error_details}")
+                    resultados_individuais[nome_arquivo] = {
+                        "error": f"Erro ao normalizar dados: {str(e)}. Verifique se o arquivo está no formato correto.",
+                        "info_arquivo": {
+                            "nome_arquivo": nome_arquivo,
+                            "total_registros": len(df) if 'df' in locals() else 0,
+                            "colunas_originais": list(df.columns) if 'df' in locals() and not df.empty else []
+                        }
+                    }
+                    continue
 
-                # DEBUG: Verificar padronização do drawdown
-                debug_drawdown_calculation(df)
+                # DEBUG: Verificar padronização do drawdown (após normalização)
+                try:
+                    debug_drawdown_calculation(df)
+                except Exception as e:
+                    print(f"     ⚠️ Erro no debug_drawdown_calculation: {e}")
+                    # Continuar mesmo se o debug falhar
                 
-                # Garantir que 'pnl' exista antes de calcular métricas
-                if 'pnl' not in df.columns and 'operation_result' in df.columns:
-                    df['pnl'] = df['operation_result']
-                if 'pnl' in df.columns:
-                    df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
+                # Após normalização, entry_date e pnl já devem existir
+                # Validar que temos as colunas necessárias
+                has_entry_date_col = 'entry_date' in df.columns
+                has_pnl_col = 'pnl' in df.columns
+                entry_date_valid_count = df['entry_date'].notna().sum() if has_entry_date_col else 0
+                pnl_valid_count = df['pnl'].notna().sum() if has_pnl_col else 0
+                
+                # CORREÇÃO: Se entry_date existe mas está vazio, tentar recriar a partir de Abertura
+                if has_entry_date_col and entry_date_valid_count == 0:
+                    print(f"     ⚠️ entry_date existe mas está vazio. Tentando recriar a partir de 'Abertura'...")
+                    if 'Abertura' in df.columns:
+                        try:
+                            # Tentar múltiplos formatos
+                            for fmt in ["%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+                                df['entry_date'] = pd.to_datetime(df['Abertura'], format=fmt, errors='coerce')
+                                if df['entry_date'].notna().any():
+                                    entry_date_valid_count = df['entry_date'].notna().sum()
+                                    print(f"     ✅ Recriado entry_date usando formato '{fmt}' ({entry_date_valid_count} valores válidos)")
+                                    break
+                            # Se ainda não funcionou, tentar detecção automática
+                            if entry_date_valid_count == 0:
+                                df['entry_date'] = pd.to_datetime(df['Abertura'], errors='coerce', infer_datetime_format=True)
+                                entry_date_valid_count = df['entry_date'].notna().sum()
+                                if entry_date_valid_count > 0:
+                                    print(f"     ✅ Recriado entry_date via detecção automática ({entry_date_valid_count} valores válidos)")
+                        except Exception as e:
+                            print(f"     ⚠️ Erro ao recriar entry_date: {e}")
+                
+                # Validar colunas obrigatórias
+                if not has_entry_date_col:
+                    print(f"     ❌ Coluna 'entry_date' não existe após normalização!")
+                    print(f"        Colunas disponíveis: {list(df.columns)}")
+                    resultados_individuais[nome_arquivo] = {
+                        "error": "O arquivo não contém a coluna 'entry_date' obrigatória. O backend tenta mapear automaticamente a coluna 'Abertura' para 'entry_date', mas isso pode ter falhado. Verifique se: A coluna 'Abertura' contém datas válidas; O formato da data está correto; Não há valores nulos na coluna de data.",
+                        "info_arquivo": {
+                            "nome_arquivo": nome_arquivo,
+                            "total_registros": len(df),
+                            "colunas_disponiveis": list(df.columns),
+                            "tem_abertura": 'Abertura' in df.columns
+                        }
+                    }
+                    continue
+                
+                if not has_pnl_col:
+                    print(f"     ❌ Coluna 'pnl' não existe após normalização!")
+                    resultados_individuais[nome_arquivo] = {
+                        "error": "Coluna 'pnl' não encontrada após normalização.",
+                        "info_arquivo": {
+                            "nome_arquivo": nome_arquivo,
+                            "total_registros": len(df),
+                            "colunas_disponiveis": list(df.columns)
+                        }
+                    }
+                    continue
+                
+                # CORREÇÃO CRÍTICA: Se entry_date existe mas está vazio, tentar UMA ÚLTIMA VEZ recriar
+                # Isso é importante porque a normalização pode ter falhado silenciosamente
+                if entry_date_valid_count == 0:
+                    print(f"     ⚠️ AVISO: entry_date existe mas está vazio (todos NaT). Tentando recriar UMA ÚLTIMA VEZ...")
+                    
+                    # Tentar recriar usando a coluna Abertura original (se ainda existir)
+                    if 'Abertura' in df.columns:
+                        print(f"     🔄 Tentativa final: recriando entry_date a partir de 'Abertura'...")
+                        try:
+                            # Verificar se Abertura já é datetime
+                            if pd.api.types.is_datetime64_any_dtype(df['Abertura']):
+                                df['entry_date'] = df['Abertura']
+                                entry_date_valid_count = df['entry_date'].notna().sum()
+                                if entry_date_valid_count > 0:
+                                    print(f"     ✅ SUCESSO! entry_date recriado diretamente de 'Abertura' ({entry_date_valid_count} valores válidos)")
+                                else:
+                                    print(f"     ❌ Abertura é datetime mas está vazia")
+                            else:
+                                # Tentar todos os formatos novamente
+                                for fmt in ["%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y"]:
+                                    df['entry_date'] = pd.to_datetime(df['Abertura'], format=fmt, errors='coerce')
+                                    entry_date_valid_count = df['entry_date'].notna().sum()
+                                    if entry_date_valid_count > 0:
+                                        print(f"     ✅ SUCESSO! entry_date recriado usando formato '{fmt}' ({entry_date_valid_count} valores válidos)")
+                                        break
+                                
+                                # Se ainda não funcionou, tentar detecção automática
+                                if entry_date_valid_count == 0:
+                                    df['entry_date'] = pd.to_datetime(df['Abertura'], errors='coerce')
+                                    entry_date_valid_count = df['entry_date'].notna().sum()
+                                    if entry_date_valid_count > 0:
+                                        print(f"     ✅ SUCESSO! entry_date recriado via detecção automática ({entry_date_valid_count} valores válidos)")
+                        except Exception as e:
+                            print(f"     ❌ Erro na tentativa final: {e}")
+                    
+                    # Se ainda não tem valores válidos após todas as tentativas, bloquear
+                    if entry_date_valid_count == 0:
+                        print(f"     ❌ Todas as tentativas falharam. entry_date continua vazio.")
+                        resultados_individuais[nome_arquivo] = {
+                            "error": "O arquivo não contém a coluna 'entry_date' obrigatória. O backend tenta mapear automaticamente a coluna 'Abertura' para 'entry_date', mas isso pode ter falhado. Verifique se: A coluna 'Abertura' contém datas válidas; O formato da data está correto; Não há valores nulos na coluna de data.",
+                            "info_arquivo": {
+                                "nome_arquivo": nome_arquivo,
+                                "total_registros": len(df),
+                                "colunas_disponiveis": list(df.columns),
+                                "tem_abertura": 'Abertura' in df.columns,
+                                "entry_date_vazio": True,
+                                "abertura_sample": df['Abertura'].head(3).tolist() if 'Abertura' in df.columns else None
+                            }
+                        }
+                        continue
+                    else:
+                        print(f"     ✅ entry_date recriado com sucesso! Continuando processamento...")
 
-                resultado_individual = processar_backtest_completo(df, capital_inicial=capital_inicial, cdi=cdi)
+                # CORREÇÃO: Passar taxas customizadas para processar_backtest_completo
+                # Se taxas foram fornecidas, passá-las. Caso contrário, None (cálculo automático)
+                resultado_individual = processar_backtest_completo(
+                    df, 
+                    capital_inicial=capital_inicial, 
+                    cdi=cdi,
+                    taxa_corretagem=taxa_corretagem,
+                    taxa_emolumentos=taxa_emolumentos
+                )
 
                 # Garantir compatibilidade de chaves no resultado individual (para o frontend)
                 try:
@@ -1870,12 +2296,38 @@ def api_tabela_multipla():
                 print(f"     ✅ Processado com sucesso: {nome_arquivo}")
                 
             except Exception as e:
-                print(f"❌ Erro ao processar arquivo {nome_arquivo}: {str(e)}")
+                error_msg = str(e)
+                error_type = type(e).__name__
+                
+                print(f"❌ Erro ao processar arquivo {nome_arquivo}: {error_type} - {error_msg}")
+                
+                # CORREÇÃO: Mensagem de erro mais específica baseada no tipo de erro
+                if 'entry_date' in error_msg.lower() or "'entry_date'" in error_msg:
+                    # Tentar normalizar novamente para diagnóstico
+                    try:
+                        from FunCalculos import _normalize_trades_dataframe
+                        df_test = _normalize_trades_dataframe(df.copy())
+                        has_entry_date = 'entry_date' in df_test.columns
+                        has_pnl = 'pnl' in df_test.columns
+                        entry_date_valid = df_test['entry_date'].notna().sum() if has_entry_date else 0
+                        pnl_valid = df_test['pnl'].notna().sum() if has_pnl else 0
+                        
+                        error_msg = (
+                            f"Coluna 'entry_date' não encontrada ou inválida. "
+                            f"entry_date existe: {has_entry_date}, válidos: {entry_date_valid}, "
+                            f"pnl existe: {has_pnl}, válidos: {pnl_valid}. "
+                            f"Verifique se o arquivo contém a coluna 'Abertura' com datas válidas."
+                        )
+                    except Exception as diag_error:
+                        error_msg = f"Erro ao processar arquivo: {error_msg}. Diagnóstico adicional falhou: {diag_error}"
+                
                 resultados_individuais[nome_arquivo] = {
-                    "error": f"Erro ao processar arquivo: {str(e)}",
+                    "error": error_msg,
+                    "error_type": error_type,
                     "info_arquivo": {
                         "nome_arquivo": nome_arquivo,
-                        "total_registros": len(df)
+                        "total_registros": len(df) if 'df' in locals() else 0,
+                        "colunas_disponiveis": list(df.columns) if 'df' in locals() and not df.empty else []
                     }
                 }
         
@@ -1887,8 +2339,33 @@ def api_tabela_multipla():
         
         df_consolidado = pd.concat(dataframes, ignore_index=True)
         print(f"   📋 DataFrame consolidado criado com {len(df_consolidado)} registros")
+        print(f"   📅 Colunas consolidadas ANTES da normalização: {list(df_consolidado.columns)[:10]}...")
         
-        resultado_consolidado = processar_backtest_completo(df_consolidado, capital_inicial=capital_inicial, cdi=cdi)
+        # CORREÇÃO CRÍTICA: Normalizar o DataFrame consolidado SEMPRE, não apenas se faltar
+        # Quando concatenamos DataFrames, eles podem ter colunas diferentes (um tem 'Abertura', outro tem 'entry_date')
+        # A normalização garante que todos tenham as mesmas colunas padronizadas
+        from FunCalculos import _normalize_trades_dataframe
+        print(f"   🔄 Normalizando DataFrame consolidado SEMPRE (shape: {df_consolidado.shape})...")
+        print(f"      Colunas antes: {list(df_consolidado.columns)[:15]}...")
+        
+        df_consolidado = _normalize_trades_dataframe(df_consolidado)
+        
+        if df_consolidado.empty:
+            print(f"   ⚠️ DataFrame consolidado ficou vazio após normalização")
+        else:
+            entry_date_valid = df_consolidado['entry_date'].notna().sum() if 'entry_date' in df_consolidado.columns else 0
+            pnl_valid = df_consolidado['pnl'].notna().sum() if 'pnl' in df_consolidado.columns else 0
+            print(f"   ✅ DataFrame consolidado normalizado: entry_date válidos: {entry_date_valid}/{len(df_consolidado)}, pnl válidos: {pnl_valid}/{len(df_consolidado)}")
+            print(f"      Colunas depois: {list(df_consolidado.columns)[:15]}...")
+        
+        # CORREÇÃO: Passar taxas customizadas também para o consolidado
+        resultado_consolidado = processar_backtest_completo(
+            df_consolidado, 
+            capital_inicial=capital_inicial, 
+            cdi=cdi,
+            taxa_corretagem=taxa_corretagem,
+            taxa_emolumentos=taxa_emolumentos
+        )
         # Padronizar chaves também no consolidado
         try:
             if 'Day of Week Analysis' in resultado_consolidado:
@@ -1960,19 +2437,29 @@ def gerar_equity_curve_data(df, capital_inicial=100000):
     PADRONIZADO: Usa exatamente a mesma lógica do FunCalculos.py
     """
     try:
-        # Encontrar coluna de resultado
-        resultado_col = None
-        data_col = None
+        # CORREÇÃO: Normalizar o DataFrame se necessário
+        from FunCalculos import _normalize_trades_dataframe
+        if 'entry_date' not in df.columns or 'pnl' not in df.columns:
+            df = _normalize_trades_dataframe(df)
+            if df.empty:
+                return []
         
-        for col_name in ['operation_result', 'pnl', 'resultado']:
-            if col_name in df.columns:
-                resultado_col = col_name
-                break
+        # Encontrar coluna de resultado (já deve estar normalizada como 'pnl')
+        resultado_col = 'pnl' if 'pnl' in df.columns else None
+        data_col = 'entry_date' if 'entry_date' in df.columns else None
         
-        for col_name in ['entry_date', 'data_abertura', 'data']:
-            if col_name in df.columns:
-                data_col = col_name
-                break
+        # Fallback para outras colunas se normalização falhou
+        if resultado_col is None:
+            for col_name in ['operation_result', 'resultado', 'Res. Intervalo', 'Res. Operação']:
+                if col_name in df.columns:
+                    resultado_col = col_name
+                    break
+        
+        if data_col is None:
+            for col_name in ['data_abertura', 'Abertura', 'data']:
+                if col_name in df.columns:
+                    data_col = col_name
+                    break
         
         if resultado_col is None or data_col is None:
             return []
@@ -2208,8 +2695,36 @@ def api_backtest_completo():
         capital_inicial = float(request.form.get('capital_inicial', 100000))
         cdi = float(request.form.get('cdi', 0.12))
         
-        # Usar a função completa
-        resultado = processar_backtest_completo(df, capital_inicial=capital_inicial, cdi=cdi)
+        # CORREÇÃO: Suporte para taxas customizadas de corretagem e emolumentos
+        taxa_corretagem = request.form.get('taxa_corretagem') or request.form.get('backtest_commission')
+        taxa_emolumentos = request.form.get('taxa_emolumentos') or request.form.get('backtest_fees')
+        
+        if taxa_corretagem:
+            try:
+                taxa_corretagem = float(taxa_corretagem)
+                print(f"💼 api_backtest_completo: Taxa de corretagem customizada: R$ {taxa_corretagem:.2f} por roda")
+            except:
+                taxa_corretagem = None
+        else:
+            taxa_corretagem = None
+        
+        if taxa_emolumentos:
+            try:
+                taxa_emolumentos = float(taxa_emolumentos)
+                print(f"💼 api_backtest_completo: Taxa de emolumentos customizada: R$ {taxa_emolumentos:.2f} por roda")
+            except:
+                taxa_emolumentos = None
+        else:
+            taxa_emolumentos = None
+        
+        # Usar a função completa com taxas customizadas
+        resultado = processar_backtest_completo(
+            df, 
+            capital_inicial=capital_inicial, 
+            cdi=cdi,
+            taxa_corretagem=taxa_corretagem,
+            taxa_emolumentos=taxa_emolumentos
+        )
 
         if 'Position Sizing' in resultado:
             resultado['position_sizing'] = resultado['Position Sizing']
@@ -2286,7 +2801,509 @@ def api_correlacao_data_direcao():
         return jsonify(make_json_serializable(resultado))
         
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ Erro em api_correlacao: {e}")
+        print(f"Detalhes: {error_details}")
+        return jsonify({"error": f"Erro ao processar correlação: {str(e)}"}), 500
+
+
+@app.route('/api/hourly-results', methods=['POST'])
+def api_hourly_results():
+    """
+    Endpoint para análise de resultados por hora
+    """
+    try:
+        # Verificar se tem arquivo
+        if 'file' not in request.files and 'files' not in request.files:
+            return jsonify({"error": "Nenhum arquivo enviado"}), 400
+        
+        dataframes = []
+        arquivos_processados = []
+        
+        # Processar arquivo único
+        if 'file' in request.files:
+            arquivo = request.files['file']
+            if arquivo.filename != '':
+                df = carregar_csv_safe(arquivo)
+                dataframes.append(df)
+                arquivos_processados.append(arquivo.filename)
+        
+        # Processar múltiplos arquivos
+        if 'files' in request.files:
+            arquivos = request.files.getlist('files')
+            for arquivo in arquivos:
+                if arquivo.filename != '':
+                    df = carregar_csv_safe(arquivo)
+                    dataframes.append(df)
+                    arquivos_processados.append(arquivo.filename)
+        
+        if not dataframes:
+            return jsonify({"error": "Nenhum arquivo válido encontrado"}), 400
+        
+        # Concatenar DataFrames
+        df_consolidado = pd.concat(dataframes, ignore_index=True)
+        
+        # CORREÇÃO: Normalizar antes de processar
+        from FunCalculos import _normalize_trades_dataframe
+        if 'entry_date' not in df_consolidado.columns or 'pnl' not in df_consolidado.columns:
+            df_consolidado = _normalize_trades_dataframe(df_consolidado)
+            if df_consolidado.empty:
+                return jsonify({"error": "Após normalização, o arquivo ficou vazio."}), 400
+        
+        # Validar colunas necessárias
+        if 'entry_date' not in df_consolidado.columns or 'pnl' not in df_consolidado.columns:
+            return jsonify({"error": "Colunas obrigatórias (entry_date, pnl) não encontradas"}), 400
+        
+        # Filtrar dados válidos
+        df_valid = df_consolidado.dropna(subset=['entry_date', 'pnl']).copy()
+        if df_valid.empty:
+            return jsonify({"error": "Nenhum dado válido encontrado"}), 400
+        
+        # Extrair hora da entrada
+        df_valid['hour'] = pd.to_datetime(df_valid['entry_date']).dt.hour
+        
+        # Agrupar por hora
+        hourly_stats = df_valid.groupby('hour').agg({
+            'pnl': ['sum', 'mean', 'count'],
+        }).round(2)
+        
+        hourly_stats.columns = ['total_pnl', 'avg_pnl', 'total_trades']
+        
+        # Converter para dicionário
+        resultado = {
+            "hourly_results": [
+                {
+                    "hour": int(hour),
+                    "total_pnl": float(row['total_pnl']),
+                    "avg_pnl": float(row['avg_pnl']),
+                    "total_trades": int(row['total_trades'])
+                }
+                for hour, row in hourly_stats.iterrows()
+            ],
+            "info_arquivos": {
+                "total_arquivos": len(arquivos_processados),
+                "nomes_arquivos": arquivos_processados,
+                "total_registros": len(df_consolidado)
+            }
+        }
+        
+        return jsonify(make_json_serializable(resultado))
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ Erro em api_hourly_results: {e}")
+        print(f"Detalhes: {error_details}")
+        return jsonify({"error": f"Erro ao processar resultados horários: {str(e)}"}), 500
+
+
+# Sistema de eventos em memória (pode ser substituído por banco de dados no futuro)
+_events_storage = []
+_event_id_counter = 1
+
+@app.route('/api/admin/events', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def api_admin_events():
+    """
+    Endpoint para gerenciar eventos administrativos
+    GET: Lista eventos (com filtros opcionais)
+    POST: Cria novo evento
+    PUT: Atualiza evento existente
+    DELETE: Remove evento
+    """
+    global _events_storage, _event_id_counter
+    
+    try:
+        if request.method == 'GET':
+            # Listar eventos com filtros opcionais
+            event_type = request.args.get('type')
+            status = request.args.get('status')
+            date_from = request.args.get('date_from')
+            date_to = request.args.get('date_to')
+            
+            filtered_events = _events_storage.copy()
+            
+            # Aplicar filtros
+            if event_type:
+                filtered_events = [e for e in filtered_events if e.get('type') == event_type]
+            
+            if status:
+                filtered_events = [e for e in filtered_events if e.get('status') == status]
+            
+            if date_from:
+                try:
+                    date_from_dt = pd.to_datetime(date_from)
+                    filtered_events = [
+                        e for e in filtered_events 
+                        if pd.to_datetime(e.get('created_at', '2000-01-01')) >= date_from_dt
+                    ]
+                except:
+                    pass
+            
+            if date_to:
+                try:
+                    date_to_dt = pd.to_datetime(date_to)
+                    filtered_events = [
+                        e for e in filtered_events 
+                        if pd.to_datetime(e.get('created_at', '2099-12-31')) <= date_to_dt
+                    ]
+                except:
+                    pass
+            
+            # Ordenar por data (mais recente primeiro)
+            filtered_events.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+            
+            return jsonify({
+                "events": filtered_events,
+                "total": len(filtered_events),
+                "message": "Eventos listados com sucesso"
+            })
+        
+        elif request.method == 'POST':
+            # Criar novo evento
+            data = request.get_json() if request.is_json else request.form.to_dict()
+            
+            # Validar campos obrigatórios
+            required_fields = ['title', 'type', 'description']
+            missing_fields = [field for field in required_fields if not data.get(field)]
+            
+            if missing_fields:
+                return jsonify({
+                    "error": f"Campos obrigatórios faltando: {', '.join(missing_fields)}"
+                }), 400
+            
+            # Criar evento
+            new_event = {
+                "id": _event_id_counter,
+                "title": data.get('title'),
+                "type": data.get('type'),  # 'info', 'warning', 'error', 'success', 'maintenance'
+                "description": data.get('description'),
+                "status": data.get('status', 'active'),  # 'active', 'resolved', 'archived'
+                "priority": data.get('priority', 'medium'),  # 'low', 'medium', 'high', 'critical'
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "created_by": data.get('created_by', 'system'),
+                "metadata": data.get('metadata', {})
+            }
+            
+            _events_storage.append(new_event)
+            _event_id_counter += 1
+            
+            return jsonify({
+                "message": "Evento criado com sucesso",
+                "event": new_event
+            }), 201
+        
+        elif request.method == 'PUT':
+            # Atualizar evento existente
+            data = request.get_json() if request.is_json else request.form.to_dict()
+            event_id = data.get('id') or request.args.get('id')
+            
+            if not event_id:
+                return jsonify({"error": "ID do evento é obrigatório"}), 400
+            
+            try:
+                event_id = int(event_id)
+            except:
+                return jsonify({"error": "ID do evento inválido"}), 400
+            
+            # Encontrar evento
+            event_index = None
+            for i, event in enumerate(_events_storage):
+                if event.get('id') == event_id:
+                    event_index = i
+                    break
+            
+            if event_index is None:
+                return jsonify({"error": "Evento não encontrado"}), 404
+            
+            # Atualizar campos permitidos
+            allowed_fields = ['title', 'type', 'description', 'status', 'priority', 'metadata']
+            for field in allowed_fields:
+                if field in data:
+                    _events_storage[event_index][field] = data[field]
+            
+            _events_storage[event_index]['updated_at'] = datetime.now().isoformat()
+            
+            return jsonify({
+                "message": "Evento atualizado com sucesso",
+                "event": _events_storage[event_index]
+            })
+        
+        elif request.method == 'DELETE':
+            # Remover evento
+            event_id = request.args.get('id') or (request.get_json() if request.is_json else {}).get('id')
+            
+            if not event_id:
+                return jsonify({"error": "ID do evento é obrigatório"}), 400
+            
+            try:
+                event_id = int(event_id)
+            except:
+                return jsonify({"error": "ID do evento inválido"}), 400
+            
+            # Encontrar e remover evento
+            event_index = None
+            for i, event in enumerate(_events_storage):
+                if event.get('id') == event_id:
+                    event_index = i
+                    break
+            
+            if event_index is None:
+                return jsonify({"error": "Evento não encontrado"}), 404
+            
+            removed_event = _events_storage.pop(event_index)
+            
+            return jsonify({
+                "message": "Evento removido com sucesso",
+                "event": removed_event
+            })
+        
+    except Exception as e:
+        print(f"❌ Erro ao processar eventos: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erro ao processar eventos: {str(e)}"}), 500
+
+
+# ============ SISTEMA DE MAILING ============
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+def _send_email(to_email: str, subject: str, body: str, html_body: str = None, attachments: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Função auxiliar para enviar emails
+    Retorna dict com status da operação
+    """
+    try:
+        # Configurações de email a partir de variáveis de ambiente
+        smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+        smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        smtp_username = os.getenv('SMTP_USERNAME', '')
+        smtp_password = os.getenv('SMTP_PASSWORD', '')
+        from_email = os.getenv('SMTP_FROM_EMAIL', smtp_username)
+        
+        # Se não tem configurações, retornar erro
+        if not smtp_username or not smtp_password:
+            return {
+                "success": False,
+                "error": "Configurações de email não encontradas. Configure SMTP_USERNAME e SMTP_PASSWORD nas variáveis de ambiente."
+            }
+        
+        # Criar mensagem
+        msg = MIMEMultipart('alternative')
+        msg['From'] = from_email
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        
+        # Adicionar corpo do email
+        if html_body:
+            part1 = MIMEText(body, 'plain')
+            part2 = MIMEText(html_body, 'html')
+            msg.attach(part1)
+            msg.attach(part2)
+        else:
+            msg.attach(MIMEText(body, 'plain'))
+        
+        # Adicionar anexos se houver
+        if attachments:
+            for attachment in attachments:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(attachment['content'])
+                encoders.encode_base64(part)
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename= {attachment["filename"]}'
+                )
+                msg.attach(part)
+        
+        # Conectar e enviar
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        text = msg.as_string()
+        server.sendmail(from_email, to_email, text)
+        server.quit()
+        
+        return {
+            "success": True,
+            "message": f"Email enviado com sucesso para {to_email}"
+        }
+    
+    except Exception as e:
+        print(f"❌ Erro ao enviar email: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.route('/api/mailing/send', methods=['POST'])
+def api_mailing_send():
+    """
+    Endpoint para enviar emails
+    POST: Envia email para destinatário(s)
+    """
+    try:
+        data = request.get_json() if request.is_json else request.form.to_dict()
+        
+        # Validar campos obrigatórios
+        to_email = data.get('to') or data.get('email') or data.get('to_email')
+        subject = data.get('subject') or data.get('titulo')
+        body = data.get('body') or data.get('message') or data.get('mensagem')
+        
+        if not to_email:
+            return jsonify({"error": "Campo 'to' (destinatário) é obrigatório"}), 400
+        
+        if not subject:
+            return jsonify({"error": "Campo 'subject' (assunto) é obrigatório"}), 400
+        
+        if not body:
+            return jsonify({"error": "Campo 'body' (corpo do email) é obrigatório"}), 400
+        
+        # Processar múltiplos destinatários (separados por vírgula)
+        recipients = [email.strip() for email in str(to_email).split(',')]
+        
+        # HTML body opcional
+        html_body = data.get('html_body') or data.get('html')
+        
+        # Anexos opcionais (lista de objetos com 'filename' e 'content' em base64)
+        attachments = data.get('attachments', [])
+        processed_attachments = []
+        
+        if attachments:
+            import base64
+            for att in attachments:
+                if isinstance(att, dict) and 'filename' in att and 'content' in att:
+                    try:
+                        # Decodificar base64 se necessário
+                        content = att['content']
+                        if isinstance(content, str):
+                            content = base64.b64decode(content)
+                        processed_attachments.append({
+                            'filename': att['filename'],
+                            'content': content
+                        })
+                    except Exception as e:
+                        print(f"⚠️ Erro ao processar anexo {att.get('filename', 'unknown')}: {e}")
+        
+        # Enviar email para cada destinatário
+        results = []
+        for recipient in recipients:
+            result = _send_email(
+                to_email=recipient,
+                subject=subject,
+                body=body,
+                html_body=html_body,
+                attachments=processed_attachments if processed_attachments else None
+            )
+            results.append({
+                "recipient": recipient,
+                "success": result.get("success", False),
+                "message": result.get("message"),
+                "error": result.get("error")
+            })
+        
+        # Verificar se todos foram enviados com sucesso
+        all_success = all(r["success"] for r in results)
+        
+        return jsonify({
+            "success": all_success,
+            "results": results,
+            "total_sent": sum(1 for r in results if r["success"]),
+            "total_failed": sum(1 for r in results if not r["success"])
+        }), 200 if all_success else 207  # 207 Multi-Status se alguns falharam
+    
+    except Exception as e:
+        print(f"❌ Erro ao processar envio de email: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erro ao processar envio de email: {str(e)}"}), 500
+
+@app.route('/api/mailing/test', methods=['POST'])
+def api_mailing_test():
+    """
+    Endpoint para testar configuração de email
+    POST: Envia email de teste
+    """
+    try:
+        data = request.get_json() if request.is_json else request.form.to_dict()
+        
+        # Email de teste (ou usar o fornecido)
+        test_email = data.get('email') or data.get('to') or os.getenv('SMTP_TEST_EMAIL', '')
+        
+        if not test_email:
+            return jsonify({
+                "error": "Email de teste não fornecido. Envie 'email' no body da requisição ou configure SMTP_TEST_EMAIL nas variáveis de ambiente."
+            }), 400
+        
+        # Enviar email de teste
+        result = _send_email(
+            to_email=test_email,
+            subject="Teste de Email - DevHub Trader",
+            body="Este é um email de teste do sistema DevHub Trader.\n\nSe você recebeu este email, a configuração de email está funcionando corretamente.",
+            html_body="""
+            <html>
+                <body>
+                    <h2>Teste de Email - DevHub Trader</h2>
+                    <p>Este é um email de teste do sistema DevHub Trader.</p>
+                    <p>Se você recebeu este email, a configuração de email está funcionando corretamente.</p>
+                    <hr>
+                    <p><small>Enviado automaticamente pelo sistema DevHub Trader</small></p>
+                </body>
+            </html>
+            """
+        )
+        
+        if result.get("success"):
+            return jsonify({
+                "success": True,
+                "message": "Email de teste enviado com sucesso",
+                "details": result
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result.get("error", "Erro desconhecido ao enviar email"),
+                "details": result
+            }), 500
+    
+    except Exception as e:
+        print(f"❌ Erro ao processar teste de email: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erro ao processar teste de email: {str(e)}"}), 500
+
+@app.route('/api/mailing/config', methods=['GET'])
+def api_mailing_config():
+    """
+    Endpoint para verificar configuração de email (sem expor senhas)
+    GET: Retorna status da configuração de email
+    """
+    try:
+        smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+        smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        smtp_username = os.getenv('SMTP_USERNAME', '')
+        smtp_from_email = os.getenv('SMTP_FROM_EMAIL', '')
+        
+        # Verificar se está configurado (sem expor senha)
+        is_configured = bool(smtp_username and os.getenv('SMTP_PASSWORD', ''))
+        
+        return jsonify({
+            "configured": is_configured,
+            "smtp_server": smtp_server,
+            "smtp_port": smtp_port,
+            "smtp_username": smtp_username if smtp_username else None,
+            "smtp_from_email": smtp_from_email if smtp_from_email else None,
+            "message": "Configuração de email verificada (senha não exposta)"
+        })
+    
+    except Exception as e:
+        return jsonify({"error": f"Erro ao verificar configuração: {str(e)}"}), 500
 
 
 @app.route('/chat', methods=['POST'])
@@ -2510,11 +3527,52 @@ def api_daily_metrics():
         # Usar FunCalculos.py para garantir consistência
         from FunCalculos import processar_backtest_completo
         
+        # CORREÇÃO: Suporte para taxas customizadas de corretagem e emolumentos
+        taxa_corretagem = request.form.get('taxa_corretagem') or request.form.get('backtest_commission')
+        taxa_emolumentos = request.form.get('taxa_emolumentos') or request.form.get('backtest_fees')
+        
+        if taxa_corretagem:
+            try:
+                taxa_corretagem = float(taxa_corretagem)
+                print(f"💼 api_daily_metrics: Taxa de corretagem customizada: R$ {taxa_corretagem:.2f} por roda")
+            except:
+                taxa_corretagem = None
+        else:
+            taxa_corretagem = None
+        
+        if taxa_emolumentos:
+            try:
+                taxa_emolumentos = float(taxa_emolumentos)
+                print(f"💼 api_daily_metrics: Taxa de emolumentos customizada: R$ {taxa_emolumentos:.2f} por roda")
+            except:
+                taxa_emolumentos = None
+        else:
+            taxa_emolumentos = None
+        
         # Processar backtest completo usando FunCalculos.py
-        resultado = processar_backtest_completo(df, capital_inicial=capital_inicial, cdi=cdi)
+        resultado = processar_backtest_completo(
+            df, 
+            capital_inicial=capital_inicial, 
+            cdi=cdi,
+            taxa_corretagem=taxa_corretagem,
+            taxa_emolumentos=taxa_emolumentos
+        )
         
         # Extrair apenas as métricas principais do resultado
         performance_metrics = resultado.get("Performance Metrics", {})
+        
+        # Extrair custos operacionais
+        operational_costs = resultado.get("Operational Costs", {})
+        corretagem_total = operational_costs.get("corretagem", 0.0) if operational_costs else 0.0
+        emolumentos_total = operational_costs.get("emolumentos", 0.0) if operational_costs else 0.0
+        
+        # Se não encontrou nos custos operacionais, buscar nas métricas de performance
+        if corretagem_total == 0.0:
+            corretagem_total = performance_metrics.get("Total Brokerage", performance_metrics.get("Corretagem Total", 0.0))
+        if emolumentos_total == 0.0:
+            emolumentos_total = performance_metrics.get("Total Fees", performance_metrics.get("Emolumentos Totais", 0.0))
+        
+        print(f"🔍 api_daily_metrics: Corretagem: R$ {corretagem_total:.2f}, Emolumentos: R$ {emolumentos_total:.2f}")
         
         # Converter para formato esperado pelo frontend
         metricas_principais = {
@@ -2528,6 +3586,8 @@ def api_daily_metrics():
             "fator_lucro": performance_metrics.get("Profit Factor", 0),
             "win_rate": performance_metrics.get("Win Rate (%)", 0),
             "roi": (performance_metrics.get("Net Profit", 0) / capital_inicial * 100) if capital_inicial > 0 else 0,
+            "corretagem_total": corretagem_total,
+            "emolumentos_total": emolumentos_total,
             # Campos adicionais para compatibilidade
             "drawdown_maximo_padronizado": -performance_metrics.get("Max Drawdown ($)", 0),
             "drawdown_maximo_pct_padronizado": performance_metrics.get("Max Drawdown (%)", 0),
@@ -3008,10 +4068,46 @@ def debug_drawdown_calculation(df: pd.DataFrame) -> Dict[str, float]:
     if df.empty:
         return {}
     
+    # CORREÇÃO: Normalizar o DataFrame se necessário
+    from FunCalculos import _normalize_trades_dataframe
+    if 'entry_date' not in df.columns or 'pnl' not in df.columns:
+        df = _normalize_trades_dataframe(df)
+        if df.empty:
+            return {}
+    
     print("🔍 DEBUG - Verificação de padronização do drawdown:")
     
+    # CORREÇÃO: Validar que temos as colunas necessárias ANTES de usar
+    if 'entry_date' not in df.columns:
+        print("❌ Coluna 'entry_date' não encontrada após normalização")
+        print(f"   Colunas disponíveis: {list(df.columns)}")
+        return {}
+    
+    if 'pnl' not in df.columns:
+        print("❌ Coluna 'pnl' não encontrada após normalização")
+        print(f"   Colunas disponíveis: {list(df.columns)}")
+        return {}
+    
+    # Verificar se há valores válidos
+    entry_date_valid = df['entry_date'].notna().sum()
+    pnl_valid = df['pnl'].notna().sum()
+    
+    if entry_date_valid == 0:
+        print(f"⚠️ Nenhuma data válida encontrada (todas são NaT)")
+        print(f"   Tentando continuar sem validação de data...")
+    
+    if pnl_valid == 0:
+        print(f"⚠️ Nenhum PnL válido encontrado")
+        return {}
+    
     # Método 1: FunCalculos.py (trades individuais)
-    df_valid = df.dropna(subset=['pnl', 'entry_date']).copy()
+    # Filtrar apenas linhas que têm AMBOS os valores válidos
+    df_valid = df[df['entry_date'].notna() & df['pnl'].notna()].copy()
+    
+    if df_valid.empty:
+        print("⚠️ Nenhuma linha com entry_date e pnl válidos")
+        return {}
+    
     df_valid = df_valid.sort_values('entry_date').reset_index(drop=True)
     
     equity = df_valid['pnl'].cumsum()
@@ -3081,6 +4177,18 @@ def calcular_drawdown_padronizado(df: pd.DataFrame) -> Dict[str, float]:
             "saldo_final": 0.0,
             "capital_inicial": 0.0
         }
+    
+    # CORREÇÃO: Normalizar o DataFrame se necessário
+    from FunCalculos import _normalize_trades_dataframe
+    if 'entry_date' not in df.columns or 'pnl' not in df.columns:
+        df = _normalize_trades_dataframe(df)
+        if df.empty:
+            return {
+                "max_drawdown": 0.0,
+                "max_drawdown_pct": 0.0,
+                "saldo_final": 0.0,
+                "capital_inicial": 0.0
+            }
     
     # Filtrar trades válidas
     df_valid = df.dropna(subset=['pnl', 'entry_date']).copy()
