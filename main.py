@@ -5,7 +5,7 @@ import openai
 from openai import OpenAI as _OpenAIClient
 from FunMultiCalculos import processar_multiplos_arquivos, processar_multiplos_arquivos_comparativo
 from Correlacao import *
-from FunCalculos import carregar_csv, calcular_performance, calcular_day_of_week, calcular_monthly, processar_backtest_completo, calcular_dados_grafico
+from FunCalculos import carregar_csv, calcular_performance, calcular_day_of_week, calcular_monthly, processar_backtest_completo, calcular_dados_grafico, _normalize_trades_dataframe
 import dotenv
 import os.path as _path
 import pandas as pd
@@ -26,15 +26,21 @@ dotenv.load_dotenv(dotenv_path=_path.join(_path.dirname(__file__), '..', 'projec
 app = Flask(__name__)
 
 # Configuração CORS para permitir acesso do frontend
-CORS(app, origins=[
-    'http://localhost:4173',  # Desenvolvimento local
-    'http://localhost:5173',  # Vite dev server
-    'http://localhost:3000',  # Desenvolvimento local (alternativo)
-    'https://devhubtrader.com.br',  # Produção
-    'https://www.devhubtrader.com.br',  # Produção com www
-    'http://devhubtrader.com.br',  # Produção sem SSL
-    'http://www.devhubtrader.com.br'  # Produção sem SSL com www
-], supports_credentials=True, allow_headers=['Content-Type', 'Authorization', 'x-openai-key'], methods=['GET','POST','OPTIONS'])
+CORS(app, 
+     origins=[
+         'http://localhost:4173',  # Desenvolvimento local
+         'http://localhost:5173',  # Vite dev server
+         'http://localhost:3000',  # Desenvolvimento local (alternativo)
+         'https://devhubtrader.com.br',  # Produção
+         'https://www.devhubtrader.com.br',  # Produção com www
+         'http://devhubtrader.com.br',  # Produção sem SSL
+         'http://www.devhubtrader.com.br'  # Produção sem SSL com www
+     ],
+     supports_credentials=True, 
+     allow_headers=['Content-Type', 'Authorization', 'x-openai-key', 'X-Requested-With'],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+     expose_headers=['Content-Type', 'Authorization'],
+     max_age=3600)
 
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
