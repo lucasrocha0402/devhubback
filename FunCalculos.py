@@ -863,8 +863,9 @@ def calcular_custos_backtest(df: pd.DataFrame, taxa_corretagem: float = 0.0, tax
         # Taxas padrão do mercado brasileiro de futuros (por contrato/roda)
         # Corretagem: R$ 0,50 por contrato/roda (entrada = 1 roda, saída = 1 roda, total = 2 rodas = R$ 1,00 por trade completo)
         # Emolumentos: R$ 0,03 por contrato/roda (entrada + saída = R$ 0,06 por trade completo)
-        TAXA_CORRETAGEM_POR_RODA = 0.50  # Por roda
-        TAXA_EMOLUMENTOS_POR_RODA = 0.03  # Por roda
+        # CORREÇÃO: Usar taxas fornecidas se disponíveis, senão usar padrões
+        TAXA_CORRETAGEM_POR_RODA = taxa_corretagem if taxa_corretagem is not None and taxa_corretagem > 0.0 else 0.50  # Por roda
+        TAXA_EMOLUMENTOS_POR_RODA = taxa_emolumentos if taxa_emolumentos is not None and taxa_emolumentos > 0.0 else 0.03  # Por roda
         
         # Tentar calcular com base em diferentes fontes de dados
         quantidade_total_rodas = 0
@@ -947,22 +948,52 @@ def calcular_custos_backtest(df: pd.DataFrame, taxa_corretagem: float = 0.0, tax
                 emolumentos_total = quantidade_total_rodas * TAXA_EMOLUMENTOS_POR_RODA
                 print(f"   ✅ Emolumentos calculados automaticamente (fallback): {total_trades} trades × 2 rodas × R$ {TAXA_EMOLUMENTOS_POR_RODA:.2f} = R$ {emolumentos_total:.2f}")
     
-    # Se ainda não encontrou e tem taxas fornecidas, usar essas taxas
-    if corretagem_total == 0.0 and taxa_corretagem > 0.0:
-        if 'entry_price' in normalized.columns and 'exit_price' in normalized.columns:
-            df_valid = normalized.dropna(subset=['entry_price', 'exit_price'])
-            total_trades_valid = len(df_valid)
-            corretagem_total = total_trades_valid * taxa_corretagem
-            print(f"📊 Calculando corretagem com taxa fornecida: {total_trades_valid} trades × R$ {taxa_corretagem:.2f} = R$ {corretagem_total:.2f}")
+    # CORREÇÃO: Se taxas foram fornecidas, SEMPRE usar elas (sobrescrever valores encontrados se necessário)
+    # Isso permite que o usuário configure taxas customizadas
+    if taxa_corretagem is not None and taxa_corretagem > 0.0:
+        # Calcular quantidade de rodas para aplicar a taxa
+        quantidade_rodas_para_corretagem = quantidade_total_rodas if quantidade_total_rodas > 0 else (total_trades * 2)
+        
+        # Corretagem pode ser por roda ou por trade, dependendo de como foi configurada
+        # Se taxa_corretagem < 1, provavelmente é por roda. Se >= 1, pode ser por trade
+        if taxa_corretagem < 1.0:
+            # Taxa por roda
+            corretagem_total = quantidade_rodas_para_corretagem * taxa_corretagem
+            print(f"📊 Calculando corretagem com taxa fornecida (por roda): {quantidade_rodas_para_corretagem:.0f} rodas × R$ {taxa_corretagem:.2f} = R$ {corretagem_total:.2f}")
+        else:
+            # Taxa por trade
+            corretagem_total = total_trades * taxa_corretagem
+            print(f"📊 Calculando corretagem com taxa fornecida (por trade): {total_trades} trades × R$ {taxa_corretagem:.2f} = R$ {corretagem_total:.2f}")
     
-    if emolumentos_total == 0.0 and taxa_emolumentos > 0.0:
-        if 'entry_price' in normalized.columns and 'exit_price' in normalized.columns:
-            df_valid = normalized.dropna(subset=['entry_price', 'exit_price'])
-            valor_entrada = df_valid['entry_price'] * df_valid['position_size']
-            valor_saida = df_valid['exit_price'] * df_valid['position_size']
-            valor_total_operado = float((valor_entrada + valor_saida).sum())
-            emolumentos_total = valor_total_operado * (taxa_emolumentos / 100.0)
-            print(f"📊 Calculando emolumentos com taxa fornecida: R$ {valor_total_operado:.2f} × {taxa_emolumentos}% = R$ {emolumentos_total:.2f}")
+    if taxa_emolumentos is not None and taxa_emolumentos > 0.0:
+        # Emolumentos podem ser percentual ou fixo por roda
+        if taxa_emolumentos < 1.0:
+            # Se < 1%, provavelmente é percentual (ex: 0.03 = 3%)
+            # Calcular sobre valor operado
+            if 'entry_price' in normalized.columns and 'exit_price' in normalized.columns:
+                df_valid = normalized.dropna(subset=['entry_price', 'exit_price'])
+                if len(df_valid) > 0:
+                    # Tentar usar position_size se disponível
+                    if 'position_size' in df_valid.columns:
+                        valor_entrada = df_valid['entry_price'] * df_valid['position_size']
+                        valor_saida = df_valid['exit_price'] * df_valid['position_size']
+                    else:
+                        # Fallback: assumir 1 contrato
+                        valor_entrada = df_valid['entry_price']
+                        valor_saida = df_valid['exit_price']
+                    valor_total_operado = float((valor_entrada + valor_saida).sum())
+                    emolumentos_total = valor_total_operado * (taxa_emolumentos / 100.0)
+                    print(f"📊 Calculando emolumentos com taxa percentual fornecida: R$ {valor_total_operado:.2f} × {taxa_emolumentos * 100:.4f}% = R$ {emolumentos_total:.2f}")
+            else:
+                # Se não tem preços, usar quantidade de rodas
+                quantidade_rodas_para_emolumentos = quantidade_total_rodas if quantidade_total_rodas > 0 else (total_trades * 2)
+                emolumentos_total = quantidade_rodas_para_emolumentos * taxa_emolumentos
+                print(f"📊 Calculando emolumentos com taxa fornecida (por roda): {quantidade_rodas_para_emolumentos:.0f} rodas × R$ {taxa_emolumentos:.2f} = R$ {emolumentos_total:.2f}")
+        else:
+            # Taxa fixa por roda
+            quantidade_rodas_para_emolumentos = quantidade_total_rodas if quantidade_total_rodas > 0 else (total_trades * 2)
+            emolumentos_total = quantidade_rodas_para_emolumentos * taxa_emolumentos
+            print(f"📊 Calculando emolumentos com taxa fixa fornecida (por roda): {quantidade_rodas_para_emolumentos:.0f} rodas × R$ {taxa_emolumentos:.2f} = R$ {emolumentos_total:.2f}")
     
     # Se ainda não encontrou, mostrar aviso
     if corretagem_total == 0.0:
@@ -996,8 +1027,8 @@ def calcular_custos_backtest(df: pd.DataFrame, taxa_corretagem: float = 0.0, tax
 
 def _read_csv_with_header(file_obj):
     """
-    Lê conteúdo do CSV e garante que o cabeçalho real seja usado.
-    CORRIGIDO: Suporta diferentes tipos de arquivos e formatos.
+    Lê conteúdo do CSV/Excel e garante que o cabeçalho real seja usado.
+    CORRIGIDO: Suporta diferentes tipos de arquivos e formatos (CSV, XLS, XLSX, JSON).
     Retorna DataFrame com os dados brutos.
     """
     try:
@@ -1011,30 +1042,109 @@ def _read_csv_with_header(file_obj):
             # Tentar obter nome do arquivo de outras formas
             filename = getattr(file_obj, 'name', str(file_obj)).lower()
         
-        # Tentar ler como Excel se for .xlsx ou .xls
-        if filename.endswith(('.xlsx', '.xls')):
+        # CORREÇÃO: Tentar ler como Excel se for .xlsx ou .xls (com múltiplas estratégias)
+        if filename.endswith(('.xlsx', '.xls', '.xlsm')):
+            print(f"📊 Detectado arquivo Excel: {filename}")
+            df_excel = None
+            last_error = None
+            
+            # Estratégia 1: Tentar ler diretamente (pode ter cabeçalho na primeira linha)
             try:
-                # Tentar diferentes engines para Excel
-                if filename.endswith('.xlsx'):
+                if filename.endswith('.xlsx') or filename.endswith('.xlsm'):
+                    # Para XLSX, tentar openpyxl primeiro
                     try:
-                        df = pd.read_excel(file_obj, engine='openpyxl')
-                    except ImportError:
-                        df = pd.read_excel(file_obj, engine='xlrd')
+                        df_excel = pd.read_excel(file_obj, engine='openpyxl', header=0)
+                        print(f"   ✅ Lido com openpyxl (header=0)")
+                    except Exception as e1:
+                        print(f"   ⚠️ openpyxl falhou: {e1}")
+                        try:
+                            df_excel = pd.read_excel(file_obj, engine='openpyxl', header=None)
+                            print(f"   ✅ Lido com openpyxl (header=None)")
+                        except Exception as e2:
+                            print(f"   ⚠️ openpyxl (header=None) falhou: {e2}")
+                            last_error = e2
                 else:
+                    # Para XLS, tentar xlrd
                     try:
-                        df = pd.read_excel(file_obj, engine='xlrd')
-                    except ImportError:
-                        df = pd.read_excel(file_obj)
-                
-                # Validar se tem colunas necessárias
-                if not df.empty and len(df.columns) > 0:
-                    # Validar que tem pelo menos uma coluna necessária
-                    required_cols = ['entry_date', 'Abertura', 'pnl', 'Res. Operação', 'Res. Intervalo']
-                    if any(col in df.columns for col in required_cols):
-                        return df
+                        df_excel = pd.read_excel(file_obj, engine='xlrd', header=0)
+                        print(f"   ✅ Lido com xlrd (header=0)")
+                    except Exception as e1:
+                        print(f"   ⚠️ xlrd (header=0) falhou: {e1}")
+                        try:
+                            df_excel = pd.read_excel(file_obj, engine='xlrd', header=None)
+                            print(f"   ✅ Lido com xlrd (header=None)")
+                        except Exception as e2:
+                            print(f"   ⚠️ xlrd (header=None) falhou: {e2}")
+                            last_error = e2
             except Exception as e:
-                # Se falhar, continuar para tentar como CSV
-                pass
+                print(f"   ⚠️ Erro geral ao ler Excel: {e}")
+                last_error = e
+            
+            # Estratégia 2: Se falhou, tentar com skiprows (alguns arquivos têm cabeçalhos nas primeiras linhas)
+            if df_excel is None or df_excel.empty:
+                for skiprows in [1, 2, 3, 4, 5]:
+                    try:
+                        if hasattr(file_obj, 'seek'):
+                            file_obj.seek(0)
+                        if filename.endswith('.xlsx') or filename.endswith('.xlsm'):
+                            df_excel = pd.read_excel(file_obj, engine='openpyxl', skiprows=skiprows)
+                        else:
+                            df_excel = pd.read_excel(file_obj, engine='xlrd', skiprows=skiprows)
+                        if not df_excel.empty and len(df_excel.columns) > 0:
+                            print(f"   ✅ Lido com skiprows={skiprows}")
+                            break
+                    except Exception as e:
+                        continue
+            
+            # Estratégia 3: Tentar detectar cabeçalho automaticamente
+            if df_excel is None or df_excel.empty:
+                try:
+                    if hasattr(file_obj, 'seek'):
+                        file_obj.seek(0)
+                    # Ler todas as linhas e procurar por padrões de cabeçalho
+                    if filename.endswith('.xlsx') or filename.endswith('.xlsm'):
+                        df_temp = pd.read_excel(file_obj, engine='openpyxl', header=None, nrows=10)
+                    else:
+                        df_temp = pd.read_excel(file_obj, engine='xlrd', header=None, nrows=10)
+                    
+                    # Procurar linha com padrões conhecidos
+                    header_patterns = ['Ativo', 'Abertura', 'entry_date', 'pnl', 'Res. Operação', 'Res. Intervalo']
+                    header_row = None
+                    for idx in range(min(10, len(df_temp))):
+                        row_values = [str(val).strip() for val in df_temp.iloc[idx].values if pd.notna(val)]
+                        if any(pattern in ' '.join(row_values) for pattern in header_patterns):
+                            header_row = idx
+                            break
+                    
+                    if header_row is not None:
+                        if hasattr(file_obj, 'seek'):
+                            file_obj.seek(0)
+                        if filename.endswith('.xlsx') or filename.endswith('.xlsm'):
+                            df_excel = pd.read_excel(file_obj, engine='openpyxl', header=header_row)
+                        else:
+                            df_excel = pd.read_excel(file_obj, engine='xlrd', header=header_row)
+                        print(f"   ✅ Lido com header detectado automaticamente na linha {header_row}")
+                except Exception as e:
+                    print(f"   ⚠️ Detecção automática de cabeçalho falhou: {e}")
+            
+            # Se conseguiu ler, validar e retornar
+            if df_excel is not None and not df_excel.empty and len(df_excel.columns) > 0:
+                # Limpar nomes de colunas (remover espaços extras, etc.)
+                df_excel.columns = [str(col).strip() for col in df_excel.columns]
+                # Validar que tem pelo menos uma coluna reconhecível
+                required_cols = ['entry_date', 'Abertura', 'pnl', 'Res. Operação', 'Res. Intervalo', 'Ativo', 'Data']
+                if any(col in df_excel.columns for col in required_cols):
+                    print(f"   ✅ Excel lido com sucesso: {len(df_excel)} linhas, {len(df_excel.columns)} colunas")
+                    return df_excel
+                else:
+                    print(f"   ⚠️ Excel lido mas sem colunas reconhecíveis. Colunas: {list(df_excel.columns)[:10]}")
+                    # Mesmo assim retornar, pois pode ser normalizado depois
+                    return df_excel
+            
+            # Se chegou aqui, não conseguiu ler como Excel
+            if last_error:
+                print(f"   ❌ Falha ao ler Excel: {last_error}")
+                # Continuar para tentar como CSV
         
         # Tentar ler como JSON se for .json
         if filename.endswith('.json'):
@@ -1045,82 +1155,199 @@ def _read_csv_with_header(file_obj):
             except Exception:
                 pass
         
-        # Ler como CSV com diferentes encodings
-        encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1', 'utf-8-sig']
-        separators = [';', ',', '\t']
+        # CORREÇÃO: Ler como CSV com diferentes estratégias (encodings, separadores, skiprows)
+        print(f"📄 Tentando ler como CSV: {filename}")
+        encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1', 'utf-8-sig', 'windows-1252']
+        separators = [';', ',', '\t', '|']
+        skiprows_options = [0, 1, 2, 3, 4, 5]  # Alguns CSVs têm cabeçalhos nas primeiras linhas
         
-        if hasattr(file_obj, 'read'):
-            original_position = file_obj.tell()
-            raw_content = file_obj.read()
-            if isinstance(raw_content, bytes):
-                # Tentar diferentes encodings
+        # Estratégia 1: Tentar ler diretamente com pandas (mais rápido)
+        for encoding in encodings:
+            for sep in separators:
+                for skiprows in skiprows_options[:3]:  # Tentar apenas primeiras 3 opções primeiro
+                    try:
+                        if hasattr(file_obj, 'seek'):
+                            file_obj.seek(0)
+                        
+                        # Tentar diferentes combinações de parâmetros
+                        read_params = {
+                            'sep': sep,
+                            'encoding': encoding,
+                            'on_bad_lines': 'skip',
+                            'engine': 'python',
+                            'skiprows': skiprows if skiprows > 0 else None
+                        }
+                        
+                        # Remover None do dict
+                        read_params = {k: v for k, v in read_params.items() if v is not None}
+                        
+                        # Tentar com decimal brasileiro (vírgula)
+                        try:
+                            read_params['decimal'] = ','
+                            if hasattr(file_obj, 'read'):
+                                df = pd.read_csv(file_obj, **read_params)
+                            else:
+                                df = pd.read_csv(file_obj, **read_params)
+                            
+                            # CORREÇÃO: Validar que tem colunas reconhecíveis e não é apenas metadados
+                            if not df.empty and len(df.columns) > 0:
+                                # Verificar se as colunas não são apenas metadados
+                                metadata_patterns = ['Data Inicial:', 'Data Final:', 'Período:', 'Início:', 'Fim:']
+                                col_names_str = ' '.join([str(col) for col in df.columns])
+                                is_metadata_only = any(meta_pattern in col_names_str for meta_pattern in metadata_patterns) and len(df.columns) <= 2
+                                
+                                if not is_metadata_only:
+                                    # Verificar se tem pelo menos uma coluna conhecida
+                                    known_cols = ['Ativo', 'Abertura', 'entry_date', 'pnl', 'Res. Operação', 'Res. Intervalo', 'Data']
+                                    if any(col in df.columns for col in known_cols):
+                                        print(f"   ✅ CSV lido com sucesso: encoding={encoding}, sep='{sep}', skiprows={skiprows}")
+                                        return df
+                                    # Se não tem colunas conhecidas mas tem múltiplas colunas, pode ser válido
+                                    elif len(df.columns) >= 3:
+                                        print(f"   ⚠️ CSV lido mas sem colunas conhecidas. Tentando continuar...")
+                                        return df
+                        except:
+                            # Tentar com decimal padrão (ponto)
+                            try:
+                                read_params.pop('decimal', None)
+                                if hasattr(file_obj, 'seek'):
+                                    file_obj.seek(0)
+                                if hasattr(file_obj, 'read'):
+                                    df = pd.read_csv(file_obj, **read_params)
+                                else:
+                                    df = pd.read_csv(file_obj, **read_params)
+                                
+                                if not df.empty and len(df.columns) > 0:
+                                    # Verificar se as colunas não são apenas metadados
+                                    metadata_patterns = ['Data Inicial:', 'Data Final:', 'Período:', 'Início:', 'Fim:']
+                                    col_names_str = ' '.join([str(col) for col in df.columns])
+                                    is_metadata_only = any(meta_pattern in col_names_str for meta_pattern in metadata_patterns) and len(df.columns) <= 2
+                                    
+                                    if not is_metadata_only:
+                                        known_cols = ['Ativo', 'Abertura', 'entry_date', 'pnl', 'Res. Operação', 'Res. Intervalo', 'Data']
+                                        if any(col in df.columns for col in known_cols):
+                                            print(f"   ✅ CSV lido com sucesso: encoding={encoding}, sep='{sep}', skiprows={skiprows}")
+                                            return df
+                                        # Se não tem colunas conhecidas mas tem múltiplas colunas, pode ser válido
+                                        elif len(df.columns) >= 3:
+                                            print(f"   ⚠️ CSV lido mas sem colunas conhecidas. Tentando continuar...")
+                                            return df
+                            except:
+                                continue
+                    except Exception as e:
+                        continue
+        
+        # Estratégia 2: Ler conteúdo bruto e detectar cabeçalho manualmente
+        print(f"   ⚠️ Leitura direta falhou, tentando detecção manual de cabeçalho...")
+        try:
+            if hasattr(file_obj, 'read'):
+                original_position = file_obj.tell()
+                file_obj.seek(0)
+                raw_content = file_obj.read()
+                if isinstance(raw_content, bytes):
+                    # Tentar diferentes encodings
+                    raw_content_str = None
+                    for encoding in encodings:
+                        try:
+                            raw_content_str = raw_content.decode(encoding, errors='ignore')
+                            break
+                        except:
+                            continue
+                    if raw_content_str is None:
+                        raw_content_str = raw_content.decode('latin1', errors='ignore')
+                else:
+                    raw_content_str = raw_content
+                file_obj.seek(original_position)
+            else:
+                # Tentar diferentes encodings ao ler arquivo
+                raw_content_str = None
                 for encoding in encodings:
                     try:
-                        raw_content_str = raw_content.decode(encoding, errors='ignore')
+                        with open(file_obj, 'r', encoding=encoding, errors='ignore') as fh:
+                            raw_content_str = fh.read()
                         break
                     except:
                         continue
-                else:
-                    raw_content_str = raw_content.decode('latin1', errors='ignore')
-            else:
-                raw_content_str = raw_content
-            file_obj.seek(original_position)
-        else:
-            # Tentar diferentes encodings ao ler arquivo
-            raw_content_str = None
-            for encoding in encodings:
+                
+                if raw_content_str is None:
+                    # Fallback para leitura binária
+                    with open(file_obj, 'rb') as fh:
+                        raw_content_bytes = fh.read()
+                        raw_content_str = raw_content_bytes.decode('latin1', errors='ignore')
+            
+            # Tentar detectar cabeçalho automaticamente
+            lines = raw_content_str.splitlines()
+            header_idx = None
+            
+            # Procurar por diferentes padrões de cabeçalho
+            header_patterns = ['Ativo', 'entry_date', 'pnl', 'Abertura', 'Res. Operação', 'Res. Intervalo', 'Data']
+            
+            # CORREÇÃO: Ignorar linhas que parecem ser metadados (ex: "Data Inicial: 17/06/2024")
+            metadata_patterns = ['Data Inicial:', 'Data Final:', 'Período:', 'Início:', 'Fim:']
+            
+            for idx, line in enumerate(lines[:20]):  # Verificar apenas primeiras 20 linhas
+                # Pular linhas que são claramente metadados
+                if any(meta_pattern in line for meta_pattern in metadata_patterns):
+                    print(f"   ⏭️ Pulando linha {idx} (metadado): {line[:50]}")
+                    continue
+                
+                # Verificar se a linha tem padrões de cabeçalho
+                if any(pattern in line for pattern in header_patterns):
+                    # Verificar se a linha tem múltiplas colunas (separadas por ; ou ,)
+                    separators_in_line = [sep for sep in [';', ',', '\t'] if line.count(sep) >= 2]
+                    if separators_in_line:
+                        header_idx = idx
+                        print(f"   ✅ Cabeçalho detectado na linha {idx}")
+                        break
+            
+            # Se não encontrou, tentar usar a primeira linha que não seja metadado
+            if header_idx is None:
+                for idx, line in enumerate(lines[:10]):
+                    if any(meta_pattern in line for meta_pattern in metadata_patterns):
+                        continue
+                    # Verificar se tem múltiplas colunas
+                    separators_in_line = [sep for sep in [';', ',', '\t'] if line.count(sep) >= 2]
+                    if separators_in_line:
+                        header_idx = idx
+                        print(f"   ⚠️ Usando linha {idx} como cabeçalho (não detectado automaticamente)")
+                        break
+                
+                if header_idx is None:
+                    header_idx = 0
+                    print(f"   ⚠️ Cabeçalho não detectado, usando primeira linha")
+            
+            csv_text = '\n'.join(lines[header_idx:])
+            data_buffer = io.StringIO(csv_text)
+            
+            # Tentar diferentes separadores
+            for sep in separators:
                 try:
-                    with open(file_obj, 'r', encoding=encoding, errors='ignore') as fh:
-                        raw_content_str = fh.read()
-                    break
+                    data_buffer.seek(0)
+                    df = pd.read_csv(data_buffer, sep=sep, decimal=',', encoding='utf-8', on_bad_lines='skip', engine='python')
+                    if not df.empty and len(df.columns) > 1:
+                        print(f"   ✅ CSV lido com detecção manual: sep='{sep}', header na linha {header_idx}")
+                        return df
                 except:
+                    data_buffer.seek(0)
                     continue
             
-            if raw_content_str is None:
-                # Fallback para leitura binária
-                with open(file_obj, 'rb') as fh:
-                    raw_content_bytes = fh.read()
-                    raw_content_str = raw_content_bytes.decode('latin1', errors='ignore')
+            # Última tentativa com separador padrão brasileiro
+            data_buffer.seek(0)
+            try:
+                df = pd.read_csv(data_buffer, sep=';', decimal=',', encoding='latin1', on_bad_lines='skip', engine='python')
+                if not df.empty:
+                    print(f"   ✅ CSV lido com configuração padrão brasileira")
+                    return df
+            except:
+                pass
+        except Exception as e:
+            print(f"   ⚠️ Detecção manual falhou: {e}")
+    
     except Exception as exc:
         raise ValueError(f"Erro ao ler o arquivo: {exc}")
-
-    # Tentar detectar cabeçalho automaticamente
-    lines = raw_content_str.splitlines()
-    header_idx = None
     
-    # Procurar por diferentes padrões de cabeçalho
-    header_patterns = ['Ativo', 'entry_date', 'pnl', 'Abertura', 'Res. Operação']
-    
-    for idx, line in enumerate(lines):
-        if any(pattern in line for pattern in header_patterns):
-            header_idx = idx
-            break
-    
-    # Se não encontrou, tentar usar a primeira linha
-    if header_idx is None:
-        header_idx = 0
-    
-    csv_text = '\n'.join(lines[header_idx:])
-    data_buffer = io.StringIO(csv_text)
-    
-    # Tentar diferentes separadores
-    for sep in separators:
-        try:
-            df = pd.read_csv(data_buffer, sep=sep, decimal=',', encoding='utf-8', on_bad_lines='skip', engine='python')
-            if not df.empty and len(df.columns) > 1:
-                data_buffer.seek(0)
-                return df
-        except:
-            data_buffer.seek(0)
-            continue
-    
-    # Última tentativa com separador padrão
-    data_buffer.seek(0)
-    try:
-        df = pd.read_csv(data_buffer, sep=';', decimal=',', encoding='latin1', on_bad_lines='skip', engine='python')
-        return df
-    except:
-        raise ValueError("Não foi possível ler o arquivo. Verifique o formato.")
+    # Se chegou aqui, não conseguiu ler de nenhuma forma
+    raise ValueError("Não foi possível ler o arquivo. Verifique se é um CSV, Excel (.xlsx/.xls) ou JSON válido.")
 
 def _compute_equity_components(pnl_series: pd.Series):
     """
@@ -1239,6 +1466,51 @@ def carregar_csv(file):
                     if temp.notna().any():
                         pnl_col = col
                         break
+        
+        # CORREÇÃO: Melhorar detecção de colunas - verificar se há colunas que parecem ser de data ou PnL
+        # mesmo que não tenham o nome exato
+        if not pnl_col and not date_col:
+            # Tentar detectar colunas por padrão de conteúdo
+            for col in df.columns:
+                col_str = str(col).strip()
+                col_lower = col_str.lower()
+                
+                # Verificar se é uma coluna de data por padrão de nome ou conteúdo
+                if not date_col:
+                    date_keywords = ['data', 'date', 'abertura', 'fechamento', 'início', 'inicio', 'fim', 'entrada', 'saída', 'saida']
+                    if any(keyword in col_lower for keyword in date_keywords):
+                        # Verificar se tem valores que parecem datas
+                        sample_values = df[col].dropna().head(10).astype(str)
+                        date_like_count = sum(1 for v in sample_values if any(char in v for char in ['/', '-', ':']) and len(v) >= 8)
+                        if date_like_count >= len(sample_values) * 0.5:  # Pelo menos 50% parecem datas
+                            date_col = col
+                            print(f"   ✅ Coluna de data detectada por padrão: {col}")
+                            continue
+                
+                # Verificar se é uma coluna de PnL por padrão de nome ou conteúdo
+                if not pnl_col:
+                    pnl_keywords = ['resultado', 'res.', 'pnl', 'lucro', 'prejuízo', 'prejuizo', 'ganho', 'perda', 'profit', 'loss']
+                    if any(keyword in col_lower for keyword in pnl_keywords):
+                        # Verificar se tem valores numéricos
+                        temp = pd.to_numeric(df[col], errors='coerce')
+                        if temp.notna().any():
+                            pnl_col = col
+                            print(f"   ✅ Coluna de PnL detectada por padrão: {col}")
+                            continue
+                
+                # Verificar se a coluna tem valores numéricos (pode ser PnL mesmo sem nome específico)
+                if not pnl_col:
+                    temp = pd.to_numeric(df[col], errors='coerce')
+                    numeric_count = temp.notna().sum()
+                    if numeric_count >= len(df) * 0.3:  # Pelo menos 30% são numéricos
+                        # Verificar se tem valores positivos e negativos (característico de PnL)
+                        numeric_values = temp.dropna()
+                        if len(numeric_values) > 0:
+                            has_positive = (numeric_values > 0).any()
+                            has_negative = (numeric_values < 0).any()
+                            if has_positive and has_negative:
+                                pnl_col = col
+                                print(f"   ✅ Coluna de PnL detectada por conteúdo numérico: {col}")
         
         # Validar que encontrou pelo menos uma coluna de PnL ou data
         if not pnl_col and not date_col:
@@ -1402,25 +1674,90 @@ def calcular_metrics(sub, cdi=0.12):
                        if col not in exclude_cols]
         pnl_col = numeric_cols[0] if len(numeric_cols) > 0 else None
     
+    # CORREÇÃO: Se não encontrou coluna de PnL, tentar usar a primeira coluna numérica válida
     if pnl_col is None:
-        return 0, 0, 0, 0, 0
+        # Última tentativa: usar qualquer coluna numérica que tenha valores
+        for col in sub.columns:
+            if col not in ['Abertura', 'Fechamento', 'entry_date', 'exit_date', 'Ativo', 'Lado']:
+                try:
+                    temp_vals = pd.to_numeric(sub[col], errors='coerce').dropna()
+                    if len(temp_vals) > 0 and temp_vals.abs().sum() > 0:
+                        pnl_col = col
+                        print(f"⚠️ Usando coluna '{col}' como PnL (não encontrada coluna padrão)")
+                        break
+                except:
+                    continue
+        
+        # Se ainda não encontrou, retornar valores vazios mas não zeros
+        if pnl_col is None:
+            print(f"❌ ERRO: Nenhuma coluna de PnL encontrada. Colunas disponíveis: {list(sub.columns)}")
+            return None, None, None, None, 0
     
-    pnl = sub[pnl_col]
-    lucro = pnl.sum()
-    trades = len(sub)
-    gross_profit = pnl[pnl > 0].sum()
-    gross_loss = abs(pnl[pnl < 0].sum())
-    pf = gross_profit / gross_loss if gross_loss > 0 else 0
-    returns = pnl.values
-    mean_return = np.mean(returns) if trades > 0 else 0
-    std_return = np.std(returns, ddof=1) if trades > 1 else 0
-    sharpe = (mean_return - cdi) / std_return if std_return > 0 else 0
+    # CORREÇÃO: Garantir que pnl_col existe e tem valores válidos
+    if pnl_col not in sub.columns:
+        return None, None, None, None, 0
+    
+    pnl = pd.to_numeric(sub[pnl_col], errors='coerce')
+    pnl_valid = pnl.dropna()
+    
+    # CORREÇÃO: Validar que há valores válidos antes de calcular
+    if len(pnl_valid) == 0:
+        print(f"⚠️ Coluna '{pnl_col}' não tem valores válidos")
+        return None, None, None, None, 0
+    
+    lucro = float(pnl_valid.sum())
+    trades = len(pnl_valid)
+    
+    # CORREÇÃO: Calcular gross_profit e gross_loss corretamente
+    gross_profit = float(pnl_valid[pnl_valid > 0].sum()) if len(pnl_valid[pnl_valid > 0]) > 0 else 0.0
+    gross_loss = float(abs(pnl_valid[pnl_valid < 0].sum())) if len(pnl_valid[pnl_valid < 0]) > 0 else 0.0
+    
+    # CORREÇÃO: Profit Factor - calcular corretamente, não retornar 0 se há dados
+    if gross_loss > 0:
+        pf = gross_profit / gross_loss
+    elif gross_profit > 0:
+        # Se não há perdas mas há lucros, profit factor é infinito (ou muito alto)
+        pf = float('inf') if gross_loss == 0 else gross_profit / gross_loss
+    else:
+        # Se não há lucros nem perdas, profit factor é indefinido
+        pf = 0.0
+    
+    returns = pnl_valid.values
+    mean_return = float(np.mean(returns)) if len(returns) > 0 else 0.0
+    
+    # CORREÇÃO: Usar desvio padrão amostral (ddof=1) para correção de Bessel
+    std_return = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+    
+    # CORREÇÃO: Calcular Sharpe Ratio corretamente - não retornar 0 se há dados válidos
+    if std_return > 0:
+        sharpe = (mean_return - cdi) / std_return
+    elif mean_return != 0:
+        # Se não há variabilidade mas há retorno médio, Sharpe é indefinido
+        sharpe = float('inf') if mean_return > cdi else float('-inf')
+    else:
+        sharpe = 0.0
+    
+    # Garantir que sharpe não seja NaN ou infinito incorretamente
+    if pd.isna(sharpe) or (np.isinf(sharpe) and std_return == 0):
+        sharpe = 0.0
 
-    equity = pnl.cumsum()
+    # CORREÇÃO: Calcular drawdown corretamente
+    equity = pnl_valid.cumsum()
     peak = equity.cummax()
     dd_ser = equity - peak
-    max_dd = float(dd_ser.min()) if not dd_ser.empty else 0
-    sharpe_dd_simplificado = ((lucro / (3 * abs(max_dd))) - cdi) * 3 if max_dd != 0 else 0
+    max_dd = float(dd_ser.min()) if len(dd_ser) > 0 and dd_ser.min() < 0 else 0.0
+    
+    # CORREÇÃO: Sharpe DD simplificado - calcular corretamente
+    if max_dd < 0 and abs(max_dd) > 0:
+        sharpe_dd_simplificado = ((lucro / (3 * abs(max_dd))) - cdi) * 3
+    else:
+        sharpe_dd_simplificado = 0.0
+    
+    # Garantir que valores não sejam NaN ou infinito
+    if pd.isna(pf) or np.isinf(pf):
+        pf = 0.0
+    if pd.isna(sharpe_dd_simplificado) or np.isinf(sharpe_dd_simplificado):
+        sharpe_dd_simplificado = 0.0
 
     return lucro, pf, sharpe, sharpe_dd_simplificado, trades
 
@@ -1481,34 +1818,87 @@ def calcular_performance(df, cdi=0.12):
     profit_pnl = profit_trades[pnl_col].dropna()
     loss_pnl = loss_trades[pnl_col].dropna()
     
-    # Calcular médias apenas com valores válidos (não nulos, não NaN, não zero quando necessário)
-    avg_win = profit_pnl.mean() if len(profit_pnl) > 0 and profit_pnl.sum() != 0 else 0.0
-    avg_loss = abs(loss_pnl.mean()) if len(loss_pnl) > 0 and loss_pnl.sum() != 0 else 0.0
-    
-    # Garantir que avg_win e avg_loss sejam valores válidos (não NaN, não infinito)
-    if pd.isna(avg_win) or np.isinf(avg_win):
+    # CORREÇÃO: Calcular médias apenas com valores válidos - garantir que não retorne 0 quando há dados
+    if len(profit_pnl) > 0:
+        avg_win = float(profit_pnl.mean())
+        # Validar que não é NaN ou infinito
+        if pd.isna(avg_win) or np.isinf(avg_win):
+            avg_win = 0.0
+    else:
         avg_win = 0.0
-    if pd.isna(avg_loss) or np.isinf(avg_loss):
+    
+    if len(loss_pnl) > 0:
+        avg_loss = float(abs(loss_pnl.mean()))
+        # Validar que não é NaN ou infinito
+        if pd.isna(avg_loss) or np.isinf(avg_loss):
+            avg_loss = 0.0
+    else:
         avg_loss = 0.0
     
-    avg_per_trade = net_profit / total_trades if total_trades > 0 else 0
-    win_rate = len(profit_trades) / total_trades * 100 if total_trades > 0 else 0
-    profit_factor = gross_profit / abs(gross_loss) if gross_loss != 0 and gross_loss != 0.0 else 0.0
+    # CORREÇÃO: Calcular métricas básicas corretamente
+    avg_per_trade = float(net_profit / total_trades) if total_trades > 0 else 0.0
+    win_rate = float(len(profit_trades) / total_trades * 100) if total_trades > 0 else 0.0
     
-    # CORREÇÃO: Calcular payoff corretamente - evitar divisão por zero e valores inválidos
+    # CORREÇÃO: Profit Factor - calcular corretamente, não retornar 0 se há dados
+    if gross_loss > 0:
+        profit_factor = float(gross_profit / abs(gross_loss))
+    elif gross_profit > 0 and gross_loss == 0:
+        # Se não há perdas mas há lucros, profit factor é muito alto (infinito prático)
+        profit_factor = float('inf')
+    else:
+        profit_factor = 0.0
+    
+    # Garantir que profit_factor não seja NaN
+    if pd.isna(profit_factor) or (np.isinf(profit_factor) and gross_loss == 0):
+        profit_factor = 0.0
+    
+    # CORREÇÃO: Calcular payoff corretamente - evitar divisão por zero
     if avg_loss > 0 and not pd.isna(avg_loss) and not np.isinf(avg_loss):
-        payoff = avg_win / avg_loss if avg_win != 0 and not pd.isna(avg_win) else 0.0
+        if avg_win > 0:
+            payoff = float(avg_win / avg_loss)
+        else:
+            payoff = 0.0
+    elif avg_win > 0 and avg_loss == 0:
+        # Se não há perdas médias mas há ganhos médios, payoff é infinito
+        payoff = float('inf')
     else:
         payoff = 0.0
     
     # Garantir que payoff seja um valor válido
-    if pd.isna(payoff) or np.isinf(payoff):
+    if pd.isna(payoff) or (np.isinf(payoff) and avg_loss == 0):
         payoff = 0.0
 
     returns = pnl.dropna().values
     mean_return = np.mean(returns) if len(returns) > 0 else 0
+    # CORREÇÃO: Usar desvio padrão amostral (ddof=1) para correção de Bessel
+    # Isso é importante para amostras pequenas (correção de viés)
     std_return = np.std(returns, ddof=1) if len(returns) > 1 else 0
-    sharpe_ratio = ((mean_return - cdi) / std_return) if std_return != 0 else 0
+    
+    # CORREÇÃO: Calcular métricas estatísticas adicionais
+    # Volatilidade (desvio padrão dos retornos)
+    volatility = std_return
+    
+    # Coeficiente de variação (volatilidade relativa)
+    coefficient_of_variation = (volatility / abs(mean_return) * 100) if mean_return != 0 else 0
+    
+    # Variância dos retornos
+    variance = np.var(returns, ddof=1) if len(returns) > 1 else 0
+    
+    # CORREÇÃO: Calcular Sharpe Ratio com desvio padrão corretamente
+    # O CDI (12% ao ano) precisa ser ajustado para o período dos retornos
+    # Se os retornos são por trade, ajustamos o CDI proporcionalmente
+    # Para simplificar, assumimos que o CDI já está na mesma unidade dos retornos
+    if std_return > 0:
+        sharpe_ratio = float((mean_return - cdi) / std_return)
+    elif mean_return != 0:
+        # Se não há variabilidade mas há retorno médio, Sharpe é indefinido
+        sharpe_ratio = float('inf') if mean_return > cdi else float('-inf')
+    else:
+        sharpe_ratio = 0.0
+    
+    # Garantir que sharpe_ratio não seja NaN ou infinito incorretamente
+    if pd.isna(sharpe_ratio) or (np.isinf(sharpe_ratio) and std_return == 0):
+        sharpe_ratio = 0.0
     # Determinar coluna de data
     if 'entry_date' in df.columns:
         date_col = 'entry_date'
@@ -1531,9 +1921,23 @@ def calcular_performance(df, cdi=0.12):
     drawdown_values = dd_ser[dd_ser < 0].abs()  # Apenas valores negativos (drawdowns)
     avg_drawdown = drawdown_values.mean() if len(drawdown_values) > 0 else 0
 
-    recovery = net_profit / abs(max_dd) if max_dd != 0 else None
-    recovery_3x = net_profit / (3 * abs(max_dd)) if max_dd != 0 else None
-    sharpe_dd_simplificado = ((net_profit / (3 * abs(max_dd))) - cdi) * 3 if max_dd != 0 else 0
+    # CORREÇÃO: Calcular recovery e sharpe_dd_simplificado corretamente
+    if max_dd < 0 and abs(max_dd) > 0:
+        recovery = float(net_profit / abs(max_dd))
+        recovery_3x = float(net_profit / (3 * abs(max_dd)))
+        sharpe_dd_simplificado = float(((net_profit / (3 * abs(max_dd))) - cdi) * 3)
+        
+        # Garantir que não sejam NaN ou infinito
+        if pd.isna(recovery) or np.isinf(recovery):
+            recovery = None
+        if pd.isna(recovery_3x) or np.isinf(recovery_3x):
+            recovery_3x = None
+        if pd.isna(sharpe_dd_simplificado) or np.isinf(sharpe_dd_simplificado):
+            sharpe_dd_simplificado = 0.0
+    else:
+        recovery = None
+        recovery_3x = None
+        sharpe_dd_simplificado = 0.0
 
     cur_loss_sum = 0.0
     max_seq_loss = 0.0
@@ -1618,6 +2022,9 @@ def calcular_performance(df, cdi=0.12):
         "Avg Losing Trade Duration": _format_timedelta(dur_loss),
         "Recovery Factor": recovery,
         "Sharpe Ratio": sharpe_dd_simplificado,
+        "Volatility": round(volatility, 2),
+        "Variance": round(variance, 2),
+        "Coefficient of Variation (%)": round(coefficient_of_variation, 2),
         "Avg Trades/Active Day": media_operacoes_por_dia,
         "Active Days": dias_com_operacoes,
         "Winning Days": winning_days,
@@ -1647,17 +2054,27 @@ def calcular_day_of_week(df, cdi=0.12):
     stats = {}
     for dia in dias:
         sub = df[df['DayOfWeek'] == dia]
-        lucro, pf, sharpe, sharpe_simp, trades = calcular_metrics(sub, cdi=cdi)
+        resultado_metrics = calcular_metrics(sub, cdi=cdi)
+        if resultado_metrics[0] is None:
+            # Se não conseguiu calcular, pular este grupo
+            continue
+        lucro, pf, sharpe, sharpe_simp, trades = resultado_metrics
         wins = sub[sub[pnl_col] > 0]
         losses = sub[sub[pnl_col] < 0]
-        win_rate = len(wins) / trades * 100 if trades > 0 else 0
+        win_rate = float(len(wins) / trades * 100) if trades > 0 else 0.0
         
         # CORREÇÃO: Calcular média de ganho e perda com validação
         wins_valid = wins[pnl_col].dropna()
         losses_valid = losses[pnl_col].dropna()
         
-        avg_win = wins_valid.mean() if len(wins_valid) > 0 else 0.0
-        avg_loss = abs(losses_valid.mean()) if len(losses_valid) > 0 else 0.0
+        avg_win = float(wins_valid.mean()) if len(wins_valid) > 0 else 0.0
+        avg_loss = float(abs(losses_valid.mean())) if len(losses_valid) > 0 else 0.0
+        
+        # Garantir que não sejam NaN ou infinito
+        if pd.isna(avg_win) or np.isinf(avg_win):
+            avg_win = 0.0
+        if pd.isna(avg_loss) or np.isinf(avg_loss):
+            avg_loss = 0.0
         
         # Garantir valores válidos
         if pd.isna(avg_win) or np.isinf(avg_win):
@@ -1775,12 +2192,16 @@ def calcular_monthly(df, cdi=0.12):
         sub = df[df['MonthNum'] == m]
         
         if len(sub) > 0:
-            lucro, pf, sharpe, sharpe_simp, trades = calcular_metrics(sub, cdi=cdi)
+            resultado_metrics = calcular_metrics(sub, cdi=cdi)
+            if resultado_metrics[0] is None or resultado_metrics[4] == 0:
+                # Se não conseguiu calcular ou não há trades, pular este mês
+                continue
+            lucro, pf, sharpe, sharpe_simp, trades = resultado_metrics
 
             # Taxa de acerto
             wins = sub[sub[pnl_col] > 0]
             losses = sub[sub[pnl_col] < 0]
-            win_rate = len(wins) / trades * 100 if trades > 0 else 0
+            win_rate = float(len(wins) / trades * 100) if trades > 0 else 0.0
             
             # Calcular média de ganho e perda
             avg_win = _safe_mean(wins[pnl_col])
@@ -1860,22 +2281,33 @@ def calcular_weekly(df, cdi=0.12):
     else:
         return {}
     
-    df['WeekNum'] = df[date_col].dt.isocalendar().week
+    # Calcular semana do mês (1-5): Semana 1 = dias 1-7, Semana 2 = dias 8-14, etc.
+    df['WeekNum'] = ((df[date_col].dt.day - 1) // 7) + 1
     stats = {}
     weeks = sorted(df['WeekNum'].unique())
     for w in weeks:
         sub = df[df['WeekNum'] == w]
-        lucro, pf, sharpe, sharpe_simp, trades = calcular_metrics(sub, cdi=cdi)
+        resultado_metrics = calcular_metrics(sub, cdi=cdi)
+        if resultado_metrics[0] is None:
+            # Se não conseguiu calcular, pular este grupo
+            continue
+        lucro, pf, sharpe, sharpe_simp, trades = resultado_metrics
         wins = sub[sub[pnl_col] > 0]
         losses = sub[sub[pnl_col] < 0]
-        win_rate = len(wins) / trades * 100 if trades > 0 else 0
+        win_rate = float(len(wins) / trades * 100) if trades > 0 else 0.0
         
         # CORREÇÃO: Calcular média de ganho e perda com validação
         wins_valid = wins[pnl_col].dropna()
         losses_valid = losses[pnl_col].dropna()
         
-        avg_win = wins_valid.mean() if len(wins_valid) > 0 else 0.0
-        avg_loss = abs(losses_valid.mean()) if len(losses_valid) > 0 else 0.0
+        avg_win = float(wins_valid.mean()) if len(wins_valid) > 0 else 0.0
+        avg_loss = float(abs(losses_valid.mean())) if len(losses_valid) > 0 else 0.0
+        
+        # Garantir que não sejam NaN ou infinito
+        if pd.isna(avg_win) or np.isinf(avg_win):
+            avg_win = 0.0
+        if pd.isna(avg_loss) or np.isinf(avg_loss):
+            avg_loss = 0.0
         
         # Garantir valores válidos
         if pd.isna(avg_win) or np.isinf(avg_win):
@@ -2154,38 +2586,32 @@ def processar_backtest_completo(df, capital_inicial=100000, cdi=0.12, taxa_corre
             }
         }
     
-    # CORREÇÃO CRÍTICA: Normalizar o DataFrame SEMPRE, mesmo se já tem entry_date
+    # CORREÇÃO CRÍTICA: Normalizar o DataFrame SEMPRE para garantir formato correto
     # Isso garante que entry_date, pnl, etc. sempre existam no formato correto
-    # Importante: Normalizar mesmo se as colunas já existem para garantir formato correto
-    print(f"🔄 processar_backtest_completo: Normalizando DataFrame (shape: {df.shape}, tem entry_date: {'entry_date' in df.columns})...")
+    # Importante: Normalizar sempre, mesmo se as colunas já existem, para garantir consistência
+    print(f"🔄 processar_backtest_completo: Normalizando DataFrame (shape: {df.shape})...")
     
-    # Verificar se precisa normalizar (se não tem entry_date OU se tem Abertura mas entry_date está vazio)
-    needs_normalization = (
-        'entry_date' not in df.columns or 
-        'pnl' not in df.columns or
-        ('Abertura' in df.columns and ('entry_date' not in df.columns or df['entry_date'].isna().all()))
-    )
+    df_original_shape = df.shape
+    df = _normalize_trades_dataframe(df)
     
-    if needs_normalization:
-        df_original_shape = df.shape
-        df = _normalize_trades_dataframe(df)
-        
-        if df.empty:
-            print(f"⚠️ processar_backtest_completo: DataFrame ficou vazio após normalização (tinha {df_original_shape[0]} linhas)")
-            return {
-                "Performance Metrics": {},
-                "Monthly Analysis": {},
-                "Day of Week Analysis": {},
-                "Weekly Analysis": {},
-                "Equity Curve Data": {
-                    "trade_by_trade": [],
-                    "daily": [],
-                    "weekly": [],
-                    "monthly": []
-                }
+    if df.empty:
+        print(f"⚠️ processar_backtest_completo: DataFrame ficou vazio após normalização (tinha {df_original_shape[0]} linhas)")
+        return {
+            "Performance Metrics": {},
+            "Monthly Analysis": {},
+            "Day of Week Analysis": {},
+            "Weekly Analysis": {},
+            "Equity Curve Data": {
+                "trade_by_trade": [],
+                "daily": [],
+                "weekly": [],
+                "monthly": []
             }
-        
-        print(f"✅ processar_backtest_completo: DataFrame normalizado (shape: {df.shape}, entry_date válidos: {df['entry_date'].notna().sum() if 'entry_date' in df.columns else 0})")
+        }
+    
+    entry_date_valid = df['entry_date'].notna().sum() if 'entry_date' in df.columns else 0
+    pnl_valid = df['pnl'].notna().sum() if 'pnl' in df.columns else 0
+    print(f"✅ processar_backtest_completo: DataFrame normalizado (shape: {df.shape}, entry_date válidos: {entry_date_valid}/{len(df)}, pnl válidos: {pnl_valid}/{len(df)})")
     
     # Validar que entry_date e pnl existem após normalização
     if 'entry_date' not in df.columns:

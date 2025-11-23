@@ -11,36 +11,80 @@ import os.path as _path
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from pathlib import Path
+from functools import wraps
+import jwt
+from supabase import create_client, Client
 
 # Carregar variáveis de ambiente de múltiplas localizações para maior robustez
-# 1) .env do diretório atual (python-freela/.env)
-dotenv.load_dotenv()
-# 2) .env explícito neste diretório
-dotenv.load_dotenv(dotenv_path=_path.join(_path.dirname(__file__), '.env'))
-# 3) .env do frontend (project/.env), caso a chave tenha sido colocada lá por engano
-dotenv.load_dotenv(dotenv_path=_path.join(_path.dirname(__file__), '..', 'project', '.env'))
+# Tenta carregar de vários locais possíveis
+env_loaded = False
+base_paths = [
+    _path.dirname(__file__),  # devhubback/
+    _path.join(_path.dirname(__file__), '..'),  # python-freela/
+    os.getcwd(),  # diretório atual de execução
+]
+
+# Primeiro tenta carregar .env, depois tenta .env.backup.*
+for base_path in base_paths:
+    env_path = _path.join(base_path, '.env')
+    if _path.exists(env_path):
+        result = dotenv.load_dotenv(dotenv_path=env_path, override=False)
+        if result:
+            print(f"[INFO] Arquivo .env carregado de: {_path.abspath(env_path)}")
+            env_loaded = True
+            break
+
+# Se não encontrou .env, tenta arquivos de backup
+if not env_loaded:
+    import glob
+    for base_path in base_paths:
+        backup_pattern = _path.join(base_path, '.env.backup.*')
+        backup_files = glob.glob(backup_pattern)
+        if backup_files:
+            # Pega o mais recente
+            backup_files.sort(reverse=True)
+            result = dotenv.load_dotenv(dotenv_path=backup_files[0], override=False)
+            if result:
+                print(f"[INFO] Arquivo .env carregado de backup: {_path.abspath(backup_files[0])}")
+                env_loaded = True
+                break
+
+# Se ainda não encontrou, tenta o padrão do python-dotenv
+if not env_loaded:
+    result = dotenv.load_dotenv()
+    if result:
+        print(f"[INFO] Arquivo .env carregado do diretório atual: {os.getcwd()}")
+        env_loaded = True
+
+if not env_loaded:
+    print("[WARN] Nenhum arquivo .env encontrado. Verifique se o arquivo existe em:")
+    for base_path in base_paths:
+        print(f"  - {_path.abspath(_path.join(base_path, '.env'))}")
 
 # main.py
 app = Flask(__name__)
 
 # Configuração CORS para permitir acesso do frontend
 CORS(app, 
-     origins=[
-         'http://localhost:4173',  # Desenvolvimento local
-         'http://localhost:5173',  # Vite dev server
-         'http://localhost:3000',  # Desenvolvimento local (alternativo)
-         'https://devhubtrader.com.br',  # Produção
-         'https://www.devhubtrader.com.br',  # Produção com www
-         'http://devhubtrader.com.br',  # Produção sem SSL
-         'http://www.devhubtrader.com.br'  # Produção sem SSL com www
-     ],
-     supports_credentials=True, 
-     allow_headers=['Content-Type', 'Authorization', 'x-openai-key', 'X-Requested-With'],
-     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-     expose_headers=['Content-Type', 'Authorization'],
-     max_age=3600)
+     resources={r"/api/*": {
+         "origins": [
+             'http://localhost:4173',
+             'http://localhost:5173',
+             'http://localhost:5174',
+             'http://localhost:3000',
+             'https://devhubtrader.com.br',
+             'https://www.devhubtrader.com.br',
+             'http://devhubtrader.com.br',
+             'http://www.devhubtrader.com.br'
+         ],
+         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+         "allow_headers": ["Content-Type", "Authorization", "x-openai-key", "X-Requested-With"],
+         "supports_credentials": True,
+         "max_age": 3600
+     }},
+     supports_credentials=True)
 
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
@@ -89,12 +133,234 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     print("[WARN] OPENAI_API_KEY não encontrado nas variáveis de ambiente. Rotas que usam OpenAI irão falhar até que seja configurado.")
 
-# ============ MIDDLEWARE PARA LOG ============
+# ============ CONFIGURAÇÃO SUPABASE ============
+# Debug: verificar variáveis relacionadas ao Supabase no ambiente
+supabase_vars = {
+    "SUPABASE_URL": os.getenv("SUPABASE_URL"),
+    "SUPABASE_SERVICE_ROLE_KEY": os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+    "SUPABASE_ANON_KEY": os.getenv("SUPABASE_ANON_KEY"),
+    "VITE_SUPABASE_URL": os.getenv("VITE_SUPABASE_URL"),  # Pode estar com prefixo VITE_
+    "VITE_SUPABASE_ANON_KEY": os.getenv("VITE_SUPABASE_ANON_KEY"),
+}
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+
+# PRIORIDADE 1: SUPABASE_URL (variável padrão)
+SUPABASE_URL = supabase_vars["SUPABASE_URL"]
+# Se não encontrou, tenta usar VITE_SUPABASE_URL
+if not SUPABASE_URL and supabase_vars["VITE_SUPABASE_URL"]:
+    SUPABASE_URL = supabase_vars["VITE_SUPABASE_URL"]
+    print(f"[INFO] Usando VITE_SUPABASE_URL como SUPABASE_URL")
+
+# Limpar e validar URL
+if SUPABASE_URL:
+    SUPABASE_URL = SUPABASE_URL.strip()
+    # Validar formato básico da URL
+    if not SUPABASE_URL.startswith('http://') and not SUPABASE_URL.startswith('https://'):
+        print(f"[ERROR] SUPABASE_URL inválida (deve começar com http:// ou https://): {SUPABASE_URL[:50]}...")
+        SUPABASE_URL = None
+
+# PRIORIDADE: Sempre usar SERVICE_ROLE_KEY primeiro (bypassa RLS)
+# Se não tiver, usar ANON_KEY como fallback (com aviso)
+SUPABASE_KEY = None
+if supabase_vars["SUPABASE_SERVICE_ROLE_KEY"]:
+    SUPABASE_KEY = supabase_vars["SUPABASE_SERVICE_ROLE_KEY"].strip()
+    print(f"[INFO] ✅ Usando SUPABASE_SERVICE_ROLE_KEY (bypassa RLS)")
+elif supabase_vars["SUPABASE_ANON_KEY"]:
+    SUPABASE_KEY = supabase_vars["SUPABASE_ANON_KEY"].strip()
+    print(f"[WARN] ⚠️  Usando SUPABASE_ANON_KEY - operações podem falhar por RLS!")
+    print(f"[WARN] Configure SUPABASE_SERVICE_ROLE_KEY no .env para bypassar RLS")
+elif supabase_vars["VITE_SUPABASE_ANON_KEY"]:
+    SUPABASE_KEY = supabase_vars["VITE_SUPABASE_ANON_KEY"].strip()
+    print(f"[WARN] ⚠️  Usando VITE_SUPABASE_ANON_KEY - operações podem falhar por RLS!")
+    print(f"[WARN] Configure SUPABASE_SERVICE_ROLE_KEY no .env para bypassar RLS")
+
+supabase_client: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        # Debug: mostrar URL e tamanho da chave (sem mostrar a chave completa)
+        print(f"[DEBUG] Tentando conectar ao Supabase...")
+        print(f"[DEBUG] URL: {SUPABASE_URL}")
+        print(f"[DEBUG] Chave configurada: {'✓' if SUPABASE_KEY else '✗'} (tamanho: {len(SUPABASE_KEY) if SUPABASE_KEY else 0} caracteres)")
+        
+        # Verificar qual tipo de chave está sendo usada
+        is_service_role = bool(supabase_vars["SUPABASE_SERVICE_ROLE_KEY"])
+        if is_service_role:
+            print("[INFO] Usando SUPABASE_SERVICE_ROLE_KEY (bypassa RLS)")
+        else:
+            print("[WARN] ⚠️  USANDO ANON_KEY - operações podem falhar por RLS!")
+            print("[WARN] Configure SUPABASE_SERVICE_ROLE_KEY no .env")
+        
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        
+        if is_service_role:
+            print("[INFO] ✅ Cliente Supabase inicializado com SERVICE_ROLE_KEY (bypassa RLS)")
+        else:
+            print("[WARN] ⚠️  Cliente Supabase inicializado com ANON_KEY (respeita RLS)")
+            print("[WARN] Operações administrativas podem falhar. Use SERVICE_ROLE_KEY.")
+    except Exception as e:
+        print(f"[WARN] Erro ao inicializar Supabase: {e}")
+        print(f"[DEBUG] SUPABASE_URL recebida: '{SUPABASE_URL}' (tipo: {type(SUPABASE_URL)}, tamanho: {len(SUPABASE_URL) if SUPABASE_URL else 0})")
+        print(f"[DEBUG] SUPABASE_KEY recebida: {'✓' if SUPABASE_KEY else '✗'} (tamanho: {len(SUPABASE_KEY) if SUPABASE_KEY else 0})")
+        import traceback
+        traceback.print_exc()
+        print("[WARN] Continuando sem Supabase - rotas de usuário não funcionarão")
+else:
+    print("[WARN] Variáveis SUPABASE_URL ou SUPABASE_KEY não encontradas.")
+    print(f"[DEBUG] SUPABASE_URL: {'✓' if SUPABASE_URL else '✗'}, SUPABASE_KEY: {'✓' if SUPABASE_KEY else '✗'}")
+    print("[DEBUG] Variáveis encontradas no ambiente:")
+    for var_name, var_value in supabase_vars.items():
+        print(f"  {var_name}: {'✓ (definida)' if var_value else '✗ (não encontrada)'}")
+    print("[WARN] Rotas de usuário não funcionarão.")
+
+# ============ FUNÇÕES HELPER PARA AUTENTICAÇÃO ============
+def get_user_id_from_token() -> Optional[str]:
+    """
+    Extrai o user_id do token JWT do Supabase no header Authorization
+    Retorna None se não conseguir autenticar
+    """
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return None
+    
+    try:
+        # Formato: "Bearer <token>"
+        token = auth_header.replace('Bearer ', '').strip()
+        if not token:
+            return None
+        
+        # Se temos JWT_SECRET, validar o token
+        if SUPABASE_JWT_SECRET:
+            try:
+                decoded = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=['HS256'], options={"verify_signature": True})
+                return decoded.get('sub')  # 'sub' é o user_id no JWT do Supabase
+            except jwt.ExpiredSignatureError:
+                return None
+            except jwt.InvalidTokenError:
+                return None
+        
+        # Se não temos JWT_SECRET, tentar decodificar sem validação (apenas para desenvolvimento)
+        # Em produção, sempre use JWT_SECRET
+        try:
+            decoded = jwt.decode(token, options={"verify_signature": False})
+            return decoded.get('sub')
+        except:
+            return None
+            
+    except Exception as e:
+        print(f"[ERROR] Erro ao decodificar token: {e}")
+        return None
+
+def require_auth(f):
+    """Decorator para rotas que requerem autenticação"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user_id = get_user_id_from_token()
+        if not user_id:
+            return jsonify({"error": "Não autenticado. Token inválido ou ausente."}), 401
+        # Adicionar user_id ao request para uso na função
+        request.user_id = user_id
+        return f(*args, **kwargs)
+    return decorated_function
+
+def get_user_supabase_client() -> Optional[Client]:
+    """
+    Retorna um cliente Supabase para operações com RLS.
+    Se SERVICE_ROLE_KEY estiver configurado, usa o cliente global (bypassa RLS).
+    Caso contrário, cria um cliente com ANON_KEY e passa o token do usuário nos headers.
+    """
+    # Se estamos usando SERVICE_ROLE_KEY, o cliente global já bypassa RLS
+    if supabase_vars.get("SUPABASE_SERVICE_ROLE_KEY"):
+        return supabase_client
+    
+    # Se não temos SERVICE_ROLE_KEY, precisamos usar o token do usuário
+    if not SUPABASE_URL:
+        return None
+    
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return None
+    
+    try:
+        # Extrair o token
+        token = auth_header.replace('Bearer ', '').strip()
+        if not token:
+            return None
+        
+        # Usar ANON_KEY para criar cliente
+        anon_key = supabase_vars.get("SUPABASE_ANON_KEY") or supabase_vars.get("VITE_SUPABASE_ANON_KEY")
+        if not anon_key:
+            print("[WARN] ANON_KEY não encontrada. Usando cliente global (pode falhar com RLS).")
+            return supabase_client
+        
+        # Criar cliente com ANON_KEY
+        # O token será passado nos headers das requisições
+        user_client = create_client(SUPABASE_URL, anon_key)
+        
+        # Armazenar o token para uso nas requisições
+        # Nota: O cliente Supabase Python não suporta set_session diretamente,
+        # mas podemos passar o token nos headers manualmente se necessário
+        return user_client
+    except Exception as e:
+        print(f"[WARN] Erro ao criar cliente Supabase com token do usuário: {e}")
+        return supabase_client
+
+# ============ MIDDLEWARE PARA LOG E CORS ============
 @app.before_request
 def log_request_info():
     """Log das requisições para debug"""
     # Silent request logging
     pass
+
+@app.after_request
+def after_request(response):
+    """Adiciona headers CORS em todas as respostas"""
+    origin = request.headers.get('Origin')
+    allowed_origins = [
+        'http://localhost:4173',
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'http://localhost:3000',
+        'https://devhubtrader.com.br',
+        'https://www.devhubtrader.com.br',
+        'http://devhubtrader.com.br',
+        'http://www.devhubtrader.com.br'
+    ]
+    
+    # Sempre adiciona headers CORS se a origem for permitida
+    if origin and origin in allowed_origins:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    # Sempre adiciona métodos e headers permitidos
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-openai-key, X-Requested-With'
+    response.headers['Access-Control-Expose-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    
+    return response
+
+@app.before_request
+def handle_preflight():
+    """Trata requisições OPTIONS (preflight)"""
+    if request.method == "OPTIONS":
+        response = jsonify({})
+        origin = request.headers.get('Origin')
+        allowed_origins = [
+            'http://localhost:4173',
+            'http://localhost:5173',
+            'http://localhost:5174',
+            'http://localhost:3000',
+            'https://devhubtrader.com.br',
+            'https://www.devhubtrader.com.br',
+            'http://devhubtrader.com.br',
+            'http://www.devhubtrader.com.br'
+        ]
+        if origin and origin in allowed_origins:
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-openai-key, X-Requested-With'
+        response.headers['Access-Control-Max-Age'] = '3600'
+        return response
 
 # ============ ROTA RAIZ ============
 @app.route('/', methods=['GET'])
@@ -224,9 +490,29 @@ def clean_numeric_value(value):
 
 
 def _parse_filters_from_request(req) -> Dict[str, Any]:
-    """Extrai filtros básicos do request (direção, etc.)."""
+    """Extrai filtros básicos do request (direção, datas, etc.)."""
     filters: Dict[str, Any] = {}
 
+    # CORREÇÃO: Verificar se os filtros vêm via JSON no body
+    if req.is_json:
+        try:
+            json_data = req.get_json(silent=True)
+            if json_data and isinstance(json_data, dict):
+                # Se há um campo 'filters' no JSON, usar ele
+                if 'filters' in json_data:
+                    filters.update(json_data['filters'])
+                # Ou se os filtros estão diretamente no JSON
+                else:
+                    # Extrair filtros diretamente do JSON
+                    for key in ('direction', 'direcao', 'directions', 'side', 'date_from', 'date_to', 
+                               'data_inicio', 'data_fim', 'asset', 'symbol', 'ativo', 'simbolo', 
+                               'strategy', 'estrategia'):
+                        if key in json_data:
+                            filters[key] = json_data[key]
+        except Exception as e:
+            print(f"⚠️ Erro ao processar filtros do JSON: {e}")
+
+    # Extrair filtros do form (FormData)
     raw_filters = req.form.get('filters') or req.form.get('filtros')
     if raw_filters:
         try:
@@ -236,6 +522,7 @@ def _parse_filters_from_request(req) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
+    # Extrair direção do form
     for key in ('direction', 'direcao', 'directions', 'side'):
         value = req.form.get(key)
         if value:
@@ -245,6 +532,147 @@ def _parse_filters_from_request(req) -> Dict[str, Any]:
                 parsed = value
             filters['direction'] = parsed
             break
+
+    # Extrair filtros de data diretamente do request (form ou JSON)
+    date_from = (filters.get('date_from') or 
+                 req.form.get('date_from') or 
+                 req.form.get('data_inicio') or 
+                 req.form.get('date_start') or
+                 (req.get_json(silent=True) or {}).get('date_from') or
+                 (req.get_json(silent=True) or {}).get('data_inicio'))
+    
+    date_to = (filters.get('date_to') or 
+               req.form.get('date_to') or 
+               req.form.get('data_fim') or 
+               req.form.get('date_end') or
+               (req.get_json(silent=True) or {}).get('date_to') or
+               (req.get_json(silent=True) or {}).get('data_fim'))
+    
+    if date_from:
+        filters['date_from'] = date_from
+    if date_to:
+        filters['date_to'] = date_to
+
+    # Extrair outros filtros diretamente do request (form ou JSON)
+    for key in ('asset', 'symbol', 'ativo', 'simbolo', 'strategy', 'estrategia'):
+        value = (filters.get(key) or 
+                req.form.get(key) or
+                (req.get_json(silent=True) or {}).get(key))
+        if value:
+            filters[key] = value
+
+    # CORREÇÃO: Extrair filtros de dia da semana (day_of_week, dia_semana, dayOfWeek)
+    day_of_week_filter = (
+        filters.get('day_of_week') or 
+        filters.get('dia_semana') or 
+        filters.get('dayOfWeek') or
+        req.form.get('day_of_week') or 
+        req.form.get('dia_semana') or
+        req.form.get('dayOfWeek') or
+        (req.get_json(silent=True) or {}).get('day_of_week') or
+        (req.get_json(silent=True) or {}).get('dia_semana') or
+        (req.get_json(silent=True) or {}).get('dayOfWeek')
+    )
+    if day_of_week_filter and day_of_week_filter not in ('Todos', 'All', 'todos', 'all', ''):
+        filters['day_of_week'] = day_of_week_filter
+
+    # CORREÇÃO: Extrair filtros de mês (month, mes, month_filter)
+    month_filter = (
+        filters.get('month') or 
+        filters.get('mes') or 
+        filters.get('month_filter') or
+        req.form.get('month') or 
+        req.form.get('mes') or
+        req.form.get('month_filter') or
+        (req.get_json(silent=True) or {}).get('month') or
+        (req.get_json(silent=True) or {}).get('mes') or
+        (req.get_json(silent=True) or {}).get('month_filter')
+    )
+    if month_filter and month_filter not in ('Todos', 'All', 'todos', 'all', ''):
+        filters['month'] = month_filter
+
+    # CORREÇÃO: Extrair filtros de horário (time_from, time_to, time_range, hora_inicio, hora_fim)
+    # Também suporta faixas pré-definidas (abertura, meio_dia, tarde, pos_mercado)
+    time_range = (
+        filters.get('time_range') or 
+        filters.get('faixa_horario') or 
+        filters.get('predefined_range') or
+        req.form.get('time_range') or 
+        req.form.get('faixa_horario') or
+        req.form.get('predefined_range') or
+        (req.get_json(silent=True) or {}).get('time_range') or
+        (req.get_json(silent=True) or {}).get('faixa_horario') or
+        (req.get_json(silent=True) or {}).get('predefined_range')
+    )
+    
+    # Mapear faixas pré-definidas para horários
+    predefined_ranges = {
+        'abertura': ('09:00', '11:00'),
+        'opening': ('09:00', '11:00'),
+        'meio_dia': ('11:00', '14:00'),
+        'mid_day': ('11:00', '14:00'),
+        'meio-dia': ('11:00', '14:00'),
+        'tarde': ('14:00', '17:30'),
+        'afternoon': ('14:00', '17:30'),
+        'pos_mercado': ('17:30', '21:00'),
+        'after_market': ('17:30', '21:00'),
+        'pós-mercado': ('17:30', '21:00'),
+        'pos-mercado': ('17:30', '21:00')
+    }
+    
+    # Se tem faixa pré-definida, usar ela
+    if time_range and time_range.lower() in predefined_ranges:
+        time_from, time_to = predefined_ranges[time_range.lower()]
+        filters['time_from'] = time_from
+        filters['time_to'] = time_to
+    else:
+        # Caso contrário, usar horários customizados
+        time_from = (
+            filters.get('time_from') or 
+            filters.get('hora_inicio') or 
+            filters.get('time_start') or
+            req.form.get('time_from') or 
+            req.form.get('hora_inicio') or
+            req.form.get('time_start') or
+            (req.get_json(silent=True) or {}).get('time_from') or
+            (req.get_json(silent=True) or {}).get('hora_inicio') or
+            (req.get_json(silent=True) or {}).get('time_start')
+        )
+        if time_from:
+            filters['time_from'] = time_from
+
+        time_to = (
+            filters.get('time_to') or 
+            filters.get('hora_fim') or 
+            filters.get('time_end') or
+            req.form.get('time_to') or 
+            req.form.get('hora_fim') or
+            req.form.get('time_end') or
+            (req.get_json(silent=True) or {}).get('time_to') or
+            (req.get_json(silent=True) or {}).get('hora_fim') or
+            (req.get_json(silent=True) or {}).get('time_end')
+        )
+        if time_to:
+            filters['time_to'] = time_to
+
+    # CORREÇÃO: Extrair data específica (specific_date, data_especifica, specificDate)
+    specific_date = (
+        filters.get('specific_date') or 
+        filters.get('data_especifica') or 
+        filters.get('specificDate') or
+        req.form.get('specific_date') or 
+        req.form.get('data_especifica') or
+        req.form.get('specificDate') or
+        (req.get_json(silent=True) or {}).get('specific_date') or
+        (req.get_json(silent=True) or {}).get('data_especifica') or
+        (req.get_json(silent=True) or {}).get('specificDate')
+    )
+    if specific_date:
+        filters['specific_date'] = specific_date
+
+    # Log dos filtros extraídos para debug
+    if filters:
+        print(f"🔍 Filtros extraídos do request: {filters}")
 
     return filters
 
@@ -271,21 +699,29 @@ _DIRECTION_MAP = {
 
 def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.DataFrame:
     """Aplica filtros padrão (direção, ativo, estratégia, datas, etc.) ao DataFrame."""
-    if df.empty or not filtros:
-        print(f"🔍 aplicar_filtros_basicos: DataFrame vazio ou sem filtros. Shape: {df.shape}, Filtros: {filtros}")
+    # CORREÇÃO: Validar se filtros não está vazio e tem valores válidos
+    if df.empty:
+        print(f"🔍 aplicar_filtros_basicos: DataFrame vazio. Shape: {df.shape}")
+        return df
+    
+    # Filtrar filtros vazios ou None
+    filtros_validos = {k: v for k, v in filtros.items() if v is not None and v != '' and v != []}
+    
+    if not filtros_validos:
+        print(f"🔍 aplicar_filtros_basicos: Nenhum filtro válido encontrado. Filtros recebidos: {filtros}")
         return df
 
     df_filtrado = df.copy()
     filtros_aplicados = []
     
-    print(f"🔍 aplicar_filtros_basicos: Aplicando filtros. Shape antes: {df_filtrado.shape}, Filtros recebidos: {filtros}")
+    print(f"🔍 aplicar_filtros_basicos: Aplicando filtros. Shape antes: {df_filtrado.shape}, Filtros válidos: {filtros_validos}")
 
     # FILTRO 1: Direção (direction, direcao, side)
     direction_filter = (
-        filtros.get('direction')
-        or filtros.get('directions')
-        or filtros.get('side')
-        or filtros.get('direcao')
+        filtros_validos.get('direction')
+        or filtros_validos.get('directions')
+        or filtros_validos.get('side')
+        or filtros_validos.get('direcao')
     )
 
     if direction_filter:
@@ -368,10 +804,10 @@ def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.Dat
 
     # FILTRO 2: Ativo/Símbolo (asset, symbol, ativo, simbolo)
     asset_filter = (
-        filtros.get('asset')
-        or filtros.get('symbol')
-        or filtros.get('ativo')
-        or filtros.get('simbolo')
+        filtros_validos.get('asset')
+        or filtros_validos.get('symbol')
+        or filtros_validos.get('ativo')
+        or filtros_validos.get('simbolo')
     )
     
     if asset_filter and not df_filtrado.empty:
@@ -403,9 +839,9 @@ def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.Dat
 
     # FILTRO 3: Estratégia (strategy, estrategia, Estratégia)
     strategy_filter = (
-        filtros.get('strategy')
-        or filtros.get('estrategia')
-        or filtros.get('Estratégia')
+        filtros_validos.get('strategy')
+        or filtros_validos.get('estrategia')
+        or filtros_validos.get('Estratégia')
     )
     
     if strategy_filter and not df_filtrado.empty:
@@ -435,8 +871,8 @@ def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.Dat
 
     # FILTRO 4: Período de datas (date_from, date_to, data_inicio, data_fim)
     if 'entry_date' in df_filtrado.columns and not df_filtrado.empty:
-        date_from = filtros.get('date_from') or filtros.get('data_inicio') or filtros.get('date_start')
-        date_to = filtros.get('date_to') or filtros.get('data_fim') or filtros.get('date_end')
+        date_from = filtros_validos.get('date_from') or filtros_validos.get('data_inicio') or filtros_validos.get('date_start')
+        date_to = filtros_validos.get('date_to') or filtros_validos.get('data_fim') or filtros_validos.get('date_end')
         
         if date_from or date_to:
             print(f"   🔍 Filtrando por período: {date_from} até {date_to}")
@@ -447,12 +883,26 @@ def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.Dat
                 if date_from:
                     date_from_dt = pd.to_datetime(date_from, errors='coerce')
                     if pd.notna(date_from_dt):
+                        # CORREÇÃO: Garantir que entry_date está como datetime antes de comparar
+                        if not pd.api.types.is_datetime64_any_dtype(df_filtrado['entry_date']):
+                            df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                        antes_filtro = len(df_filtrado)
                         df_filtrado = df_filtrado[df_filtrado['entry_date'] >= date_from_dt]
+                        depois_filtro = len(df_filtrado)
+                        print(f"      📅 Filtro date_from aplicado: {antes_filtro} -> {depois_filtro} registros")
                 
                 if date_to:
                     date_to_dt = pd.to_datetime(date_to, errors='coerce')
                     if pd.notna(date_to_dt):
+                        # CORREÇÃO: Garantir que entry_date está como datetime antes de comparar
+                        if not pd.api.types.is_datetime64_any_dtype(df_filtrado['entry_date']):
+                            df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                        # Para date_to, incluir o dia inteiro (até 23:59:59)
+                        date_to_dt = date_to_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                        antes_filtro = len(df_filtrado)
                         df_filtrado = df_filtrado[df_filtrado['entry_date'] <= date_to_dt]
+                        depois_filtro = len(df_filtrado)
+                        print(f"      📅 Filtro date_to aplicado: {antes_filtro} -> {depois_filtro} registros")
                 
                 depois = len(df_filtrado)
                 print(f"   ✅ Filtro de data aplicado: {antes} -> {depois} registros")
@@ -460,115 +910,255 @@ def aplicar_filtros_basicos(df: pd.DataFrame, filtros: Dict[str, Any]) -> pd.Dat
             except Exception as e:
                 print(f"   ⚠️ Erro ao aplicar filtro de data: {e}")
 
+    # FILTRO 5: Data específica (specific_date, data_especifica)
+    if 'entry_date' in df_filtrado.columns and not df_filtrado.empty:
+        specific_date = filtros_validos.get('specific_date') or filtros_validos.get('data_especifica')
+        
+        if specific_date:
+            print(f"   🔍 Filtrando por data específica: {specific_date}")
+            try:
+                df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                specific_date_dt = pd.to_datetime(specific_date, errors='coerce')
+                
+                if pd.notna(specific_date_dt):
+                    # Filtrar apenas o dia específico (de 00:00:00 até 23:59:59)
+                    date_start = specific_date_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                    date_end = specific_date_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+                    
+                    antes = len(df_filtrado)
+                    mask = (df_filtrado['entry_date'] >= date_start) & (df_filtrado['entry_date'] <= date_end)
+                    df_filtrado = df_filtrado[mask]
+                    depois = len(df_filtrado)
+                    print(f"   ✅ Filtro de data específica aplicado: {antes} -> {depois} registros")
+                    filtros_aplicados.append(f"data específica: {specific_date}")
+            except Exception as e:
+                print(f"   ⚠️ Erro ao aplicar filtro de data específica: {e}")
+
+    # FILTRO 6: Dia da semana (day_of_week, dia_semana)
+    if 'entry_date' in df_filtrado.columns and not df_filtrado.empty:
+        day_of_week_filter = filtros_validos.get('day_of_week') or filtros_validos.get('dia_semana')
+        
+        if day_of_week_filter and day_of_week_filter not in ('Todos', 'All', 'todos', 'all', ''):
+            print(f"   🔍 Filtrando por dia da semana: {day_of_week_filter}")
+            try:
+                df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                
+                # Mapear nomes de dias (português e inglês)
+                day_map = {
+                    'Monday': 0, 'Segunda': 0, 'Segunda-feira': 0, 'segunda': 0,
+                    'Tuesday': 1, 'Terça': 1, 'Terça-feira': 1, 'terça': 1,
+                    'Wednesday': 2, 'Quarta': 2, 'Quarta-feira': 2, 'quarta': 2,
+                    'Thursday': 3, 'Quinta': 3, 'Quinta-feira': 3, 'quinta': 3,
+                    'Friday': 4, 'Sexta': 4, 'Sexta-feira': 4, 'sexta': 4,
+                    'Saturday': 5, 'Sábado': 5, 'sábado': 5,
+                    'Sunday': 6, 'Domingo': 6, 'domingo': 6
+                }
+                
+                target_day = day_map.get(str(day_of_week_filter).strip(), None)
+                
+                if target_day is not None:
+                    antes = len(df_filtrado)
+                    df_filtrado['_day_of_week'] = df_filtrado['entry_date'].dt.dayofweek
+                    df_filtrado = df_filtrado[df_filtrado['_day_of_week'] == target_day]
+                    df_filtrado = df_filtrado.drop(columns=['_day_of_week'], errors='ignore')
+                    depois = len(df_filtrado)
+                    print(f"   ✅ Filtro de dia da semana aplicado: {antes} -> {depois} registros (dia: {day_of_week_filter})")
+                    filtros_aplicados.append(f"dia da semana: {day_of_week_filter}")
+                else:
+                    print(f"   ⚠️ Dia da semana não reconhecido: {day_of_week_filter}")
+            except Exception as e:
+                print(f"   ⚠️ Erro ao aplicar filtro de dia da semana: {e}")
+
+    # FILTRO 7: Mês (month, mes)
+    if 'entry_date' in df_filtrado.columns and not df_filtrado.empty:
+        month_filter = filtros_validos.get('month') or filtros_validos.get('mes')
+        
+        if month_filter and month_filter not in ('Todos', 'All', 'todos', 'all', ''):
+            print(f"   🔍 Filtrando por mês: {month_filter}")
+            try:
+                df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                
+                # Mapear nomes de meses (português e inglês) para números
+                month_map = {
+                    'January': 1, 'Janeiro': 1, 'jan': 1, 'january': 1,
+                    'February': 2, 'Fevereiro': 2, 'fev': 2, 'february': 2,
+                    'March': 3, 'Março': 3, 'mar': 3, 'march': 3,
+                    'April': 4, 'Abril': 4, 'abr': 4, 'april': 4,
+                    'May': 5, 'Maio': 5, 'mai': 5, 'may': 5,
+                    'June': 6, 'Junho': 6, 'jun': 6, 'june': 6,
+                    'July': 7, 'Julho': 7, 'jul': 7, 'july': 7,
+                    'August': 8, 'Agosto': 8, 'ago': 8, 'august': 8,
+                    'September': 9, 'Setembro': 9, 'set': 9, 'september': 9,
+                    'October': 10, 'Outubro': 10, 'out': 10, 'october': 10,
+                    'November': 11, 'Novembro': 11, 'nov': 11, 'november': 11,
+                    'December': 12, 'Dezembro': 12, 'dez': 12, 'december': 12
+                }
+                
+                # Tentar converter para número (1-12)
+                target_month = None
+                if isinstance(month_filter, (int, float)):
+                    target_month = int(month_filter)
+                elif str(month_filter).isdigit():
+                    target_month = int(month_filter)
+                else:
+                    target_month = month_map.get(str(month_filter).strip(), None)
+                
+                if target_month is not None and 1 <= target_month <= 12:
+                    antes = len(df_filtrado)
+                    df_filtrado['_month'] = df_filtrado['entry_date'].dt.month
+                    df_filtrado = df_filtrado[df_filtrado['_month'] == target_month]
+                    df_filtrado = df_filtrado.drop(columns=['_month'], errors='ignore')
+                    depois = len(df_filtrado)
+                    print(f"   ✅ Filtro de mês aplicado: {antes} -> {depois} registros (mês: {target_month})")
+                    filtros_aplicados.append(f"mês: {target_month}")
+                else:
+                    print(f"   ⚠️ Mês não reconhecido: {month_filter}")
+            except Exception as e:
+                print(f"   ⚠️ Erro ao aplicar filtro de mês: {e}")
+
+    # FILTRO 8: Faixa de horário (time_from, time_to, hora_inicio, hora_fim)
+    if 'entry_date' in df_filtrado.columns and not df_filtrado.empty:
+        time_from = filtros_validos.get('time_from') or filtros_validos.get('hora_inicio')
+        time_to = filtros_validos.get('time_to') or filtros_validos.get('hora_fim')
+        
+        if time_from or time_to:
+            print(f"   🔍 Filtrando por faixa de horário: {time_from} até {time_to}")
+            try:
+                df_filtrado['entry_date'] = pd.to_datetime(df_filtrado['entry_date'], errors='coerce')
+                
+                # Extrair hora e minuto do horário fornecido
+                def parse_time(time_str):
+                    """Converte string de horário (HH:MM ou HH:MM:SS) para hora e minuto"""
+                    if not time_str or time_str in ('--:--', ''):
+                        return None
+                    try:
+                        # Tentar formatos HH:MM ou HH:MM:SS
+                        parts = str(time_str).strip().split(':')
+                        if len(parts) >= 2:
+                            hour = int(parts[0])
+                            minute = int(parts[1])
+                            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                                return (hour, minute)
+                    except:
+                        pass
+                    return None
+                
+                if time_from:
+                    time_from_parsed = parse_time(time_from)
+                    if time_from_parsed:
+                        hour_from, minute_from = time_from_parsed
+                        antes = len(df_filtrado)
+                        # Criar máscara para horário >= time_from
+                        mask = (df_filtrado['entry_date'].dt.hour > hour_from) | \
+                               ((df_filtrado['entry_date'].dt.hour == hour_from) & 
+                                (df_filtrado['entry_date'].dt.minute >= minute_from))
+                        df_filtrado = df_filtrado[mask]
+                        depois = len(df_filtrado)
+                        print(f"      🕐 Filtro time_from aplicado: {antes} -> {depois} registros (>= {hour_from:02d}:{minute_from:02d})")
+                
+                if time_to:
+                    time_to_parsed = parse_time(time_to)
+                    if time_to_parsed:
+                        hour_to, minute_to = time_to_parsed
+                        antes = len(df_filtrado)
+                        # Criar máscara para horário <= time_to
+                        mask = (df_filtrado['entry_date'].dt.hour < hour_to) | \
+                               ((df_filtrado['entry_date'].dt.hour == hour_to) & 
+                                (df_filtrado['entry_date'].dt.minute <= minute_to))
+                        df_filtrado = df_filtrado[mask]
+                        depois = len(df_filtrado)
+                        print(f"      🕐 Filtro time_to aplicado: {antes} -> {depois} registros (<= {hour_to:02d}:{minute_to:02d})")
+                
+                if time_from or time_to:
+                    filtros_aplicados.append(f"horário: {time_from} até {time_to}")
+            except Exception as e:
+                print(f"   ⚠️ Erro ao aplicar filtro de horário: {e}")
+
     print(f"✅ aplicar_filtros_basicos: Filtros aplicados: {filtros_aplicados if filtros_aplicados else 'nenhum'}")
     print(f"   Shape final: {df_filtrado.shape} (antes: {df.shape})")
     
     return df_filtrado
 
 def carregar_csv_trades(file_path_or_file):
-    """Carrega CSV da planilha de trades com mapeamento específico e parsing melhorado"""
+    """
+    Carrega CSV/Excel da planilha de trades com mapeamento específico e parsing melhorado
+    CORREÇÃO: Agora usa a mesma lógica de carregar_csv para suportar todos os formatos (CSV, XLS, XLSX)
+    """
     try:
-        if hasattr(file_path_or_file, 'read'):
-            # É um arquivo upload - usar mesmos parâmetros da função original
-            df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='latin1', decimal=',')
-        else:
-            # É um caminho de arquivo
-            df = pd.read_csv(file_path_or_file, skiprows=5, sep=';', encoding='latin1', decimal=',')
+        # CORREÇÃO: Usar a função unificada carregar_csv que suporta todos os formatos
+        from FunCalculos import carregar_csv
+        df = carregar_csv(file_path_or_file)
         
-        # Processar datas conforme função original - com verificação de colunas
-        if 'Abertura' in df.columns:
-            df['Abertura']   = pd.to_datetime(df['Abertura'],   format="%d/%m/%Y %H:%M:%S", errors='coerce')
-        if 'Fechamento' in df.columns:
-            df['Fechamento'] = pd.to_datetime(df['Fechamento'], format="%d/%m/%Y %H:%M:%S", errors='coerce')
+        # A função carregar_csv já normaliza o DataFrame, então entry_date e pnl já devem existir
+        # Mas podemos fazer mapeamentos adicionais se necessário
         
-        # Usar função de limpeza para valores numéricos
-        numeric_columns = ['Res. Operação', 'Res. Operação (%)', 'Preço Compra', 'Preço Venda', 
-                          'Preço de Mercado', 'Médio', 'Res. Intervalo', 'Res. Intervalo (%)',
-                          'Res. Intervalo Bruto', 'Res. Intervalo Bruto (%)',
-                          'Drawdown', 'Ganho Max.', 'Perda Max.', 'Qtd Compra', 'Qtd Venda']
-        
-        for col in numeric_columns:
-            if col in df.columns:
-                df[col] = df[col].apply(clean_numeric_value)
-        
-        # Renomear colunas para padronizar
-        column_mapping = {
-            'Ativo': 'symbol',
-            'Abertura': 'entry_date',
-            'Fechamento': 'exit_date',
-            'Tempo Operação': 'duration_str',
-            'Qtd Compra': 'qty_buy',
-            'Qtd Venda': 'qty_sell',
-            'Lado': 'direction',
-            'Preço Compra': 'entry_price',
-            'Preço Venda': 'exit_price',
-            'Preço de Mercado': 'market_price',
-            'Médio': 'avg_price',
-            # Algumas planilhas usam "Res. Intervalo Bruto"
-            'Res. Intervalo': 'pnl',
-            'Res. Intervalo (%)': 'pnl_pct',
-            'Res. Intervalo Bruto': 'pnl',
-            'Res. Intervalo Bruto (%)': 'pnl_pct',
-            'Número Operação': 'trade_number',
-            'Res. Operação': 'operation_result',
-            'Res. Operação (%)': 'operation_result_pct',
-            'Drawdown': 'drawdown',
-            'Ganho Max.': 'max_gain',
-            'Perda Max.': 'max_loss',
-            'TET': 'tet',
-            'Total': 'total'
-        }
-        
-        # Renomear colunas existentes
-        df = df.rename(columns=column_mapping)
-        
-        # Converter direção para formato padrão
+        # Converter direção para formato padrão se ainda não foi feito
         if 'direction' in df.columns:
-            df['direction'] = df['direction'].map({'C': 'long', 'V': 'short'}).fillna('long')
-        
-        # Usar os resultados já processados (agora com valores limpos)
-        if 'operation_result' in df.columns:
-            df['pnl'] = df['operation_result']
-        if 'operation_result_pct' in df.columns:
-            df['pnl_pct'] = df['operation_result_pct']
+            # Verificar se já está no formato correto
+            sample = df['direction'].dropna().head(5)
+            if len(sample) > 0:
+                # Se tem valores como 'C' ou 'V', converter
+                if any(val in ['C', 'V', 'c', 'v'] for val in sample.astype(str)):
+                    df['direction'] = df['direction'].astype(str).str.upper().map({
+                        'C': 'long', 'COMPRA': 'long', 'COMPRADO': 'long',
+                        'V': 'short', 'VENDA': 'short', 'VENDIDO': 'short'
+                    }).fillna(df['direction'])
         
         # Calcular duração em horas se não existir
         if 'entry_date' in df.columns and 'exit_date' in df.columns:
             if df['entry_date'].notna().any() and df['exit_date'].notna().any():
-                df['duration_hours'] = (df['exit_date'] - df['entry_date']).dt.total_seconds() / 3600
+                valid_mask = df['entry_date'].notna() & df['exit_date'].notna()
+                if valid_mask.any():
+                    df.loc[valid_mask, 'duration_hours'] = (
+                        df.loc[valid_mask, 'exit_date'] - df.loc[valid_mask, 'entry_date']
+                    ).dt.total_seconds() / 3600
         
         return df
         
     except Exception as e:
-        raise ValueError(f"Erro ao processar CSV: {e}")
+        raise ValueError(f"Erro ao processar arquivo de trades: {e}")
 
 # Função carregar_csv_safe melhorada com encoding robusto
 def carregar_csv_safe(file_path_or_file):
     """
-    CORRIGIDO: Função auxiliar para carregar CSV com encoding seguro e suporte a múltiplos tipos de arquivo.
-    Agora suporta CSV, Excel (.xlsx, .xls) e JSON, além de validar campos obrigatórios.
+    CORRIGIDO: Função auxiliar para carregar CSV/Excel com encoding seguro e suporte a múltiplos tipos de arquivo.
+    Agora suporta CSV, Excel (.xlsx, .xls, .xlsm) e JSON, além de validar campos obrigatórios.
+    CORREÇÃO: Usa a mesma lógica unificada de carregar_csv para garantir padronização.
     """
     try:
-        # Usar primeiro a rotina padronizada do FunCalculos (detecção automática de cabeçalho e múltiplos formatos)
+        # CORREÇÃO: Usar a função carregar_csv do FunCalculos que foi melhorada e suporta todos os formatos
+        from FunCalculos import carregar_csv
+        
+        # Resetar posição do arquivo se for um objeto file
         if hasattr(file_path_or_file, 'seek'):
             file_path_or_file.seek(0)
         
-        # CORREÇÃO: Usar a função carregar_csv do FunCalculos que foi melhorada
+        # A função carregar_csv já faz toda a normalização e validação
         df = carregar_csv(file_path_or_file)
         
-        # CORREÇÃO: Validar campos obrigatórios após carregar
+        # CORREÇÃO: Validar campos obrigatórios após carregar (já deve estar normalizado)
         if df.empty:
             raise ValueError("O arquivo está vazio ou não contém dados válidos.")
         
-        # Validar que há pelo menos uma coluna de data e uma de PnL
-        has_date_col = any(col in df.columns for col in ['entry_date', 'Abertura'])
-        has_pnl_col = any(col in df.columns for col in ['pnl', 'Res. Operação', 'Res. Intervalo', 'operation_result'])
+        # Validar que há pelo menos uma coluna de data e uma de PnL (já deve existir após normalização)
+        has_date_col = 'entry_date' in df.columns
+        has_pnl_col = 'pnl' in df.columns
         
         if not has_date_col:
-            raise ValueError("O arquivo não contém coluna de data (entry_date ou Abertura).")
+            raise ValueError("O arquivo não contém coluna de data (entry_date). A normalização deveria ter criado esta coluna.")
         
         if not has_pnl_col:
-            raise ValueError("O arquivo não contém coluna de resultado (pnl, Res. Operação ou Res. Intervalo).")
+            raise ValueError("O arquivo não contém coluna de resultado (pnl). A normalização deveria ter criado esta coluna.")
+        
+        # Validar que há valores válidos
+        entry_date_valid = df['entry_date'].notna().sum() if has_date_col else 0
+        pnl_valid = df['pnl'].notna().sum() if has_pnl_col else 0
+        
+        if entry_date_valid == 0:
+            raise ValueError("O arquivo não contém datas válidas na coluna 'entry_date'.")
+        
+        if pnl_valid == 0:
+            raise ValueError("O arquivo não contém valores válidos na coluna 'pnl'.")
         
         return df
     except Exception as primary_error:
@@ -687,6 +1277,20 @@ def carregar_csv_safe(file_path_or_file):
             except Exception:
                 pass
 
+    # CORREÇÃO CRÍTICA: Sempre normalizar o DataFrame antes de retornar
+    # Isso garante que entry_date e pnl sempre existam no formato correto
+    from FunCalculos import _normalize_trades_dataframe
+    print(f"🔄 carregar_csv_safe: Normalizando DataFrame antes de retornar...")
+    df_original_len = len(df)
+    df = _normalize_trades_dataframe(df)
+    
+    if df.empty:
+        print(f"⚠️ carregar_csv_safe: DataFrame ficou vazio após normalização (tinha {df_original_len} linhas)")
+    else:
+        entry_date_valid = df['entry_date'].notna().sum() if 'entry_date' in df.columns else 0
+        pnl_valid = df['pnl'].notna().sum() if 'pnl' in df.columns else 0
+        print(f"✅ carregar_csv_safe: DataFrame normalizado - entry_date válidos: {entry_date_valid}/{len(df)}, pnl válidos: {pnl_valid}/{len(df)}")
+    
     print(f"🔍 DEBUG: DataFrame final, shape: {df.shape}")
     print(f"🔍 DEBUG: Colunas finais: {df.columns.tolist()}")
     return df
@@ -808,22 +1412,28 @@ def calcular_estatisticas_temporais(df: pd.DataFrame) -> Dict[str, Any]:
     if df.empty or 'entry_date' not in df.columns:
         return {}
     
-    df_valid = df.dropna(subset=['entry_date', 'pnl'])
+    # CORREÇÃO: Detectar coluna de PnL automaticamente
+    from FunCalculos import _detect_pnl_column
+    pnl_col = _detect_pnl_column(df)
+    if pnl_col is None:
+        return {}
+    
+    df_valid = df.dropna(subset=['entry_date', pnl_col])
     
     if df_valid.empty:
         return {}
     
     # Por dia da semana
     df_valid['day_of_week'] = df_valid['entry_date'].dt.day_name()
-    day_stats = df_valid.groupby('day_of_week')['pnl'].agg(['count', 'sum', 'mean']).round(2)
+    day_stats = df_valid.groupby('day_of_week')[pnl_col].agg(['count', 'sum', 'mean']).round(2)
     
     # Por mês - converter Period para string
     df_valid['month'] = df_valid['entry_date'].dt.to_period('M').astype(str)
-    month_stats = df_valid.groupby('month')['pnl'].agg(['count', 'sum', 'mean']).round(2)
+    month_stats = df_valid.groupby('month')[pnl_col].agg(['count', 'sum', 'mean']).round(2)
     
     # Por hora
     df_valid['hour'] = df_valid['entry_date'].dt.hour
-    hour_stats = df_valid.groupby('hour')['pnl'].agg(['count', 'sum', 'mean']).round(2)
+    hour_stats = df_valid.groupby('hour')[pnl_col].agg(['count', 'sum', 'mean']).round(2)
     
     # Converter DataFrames para dicionários JSON-serializáveis
     def convert_stats_to_dict(stats_df):
@@ -973,31 +1583,231 @@ def calcular_estatisticas_por_ativo(df: pd.DataFrame) -> Dict[str, Any]:
     
     return make_json_serializable(stats_by_asset)
 
-def calcular_custos_operacionais(df: pd.DataFrame, taxa_corretagem: float = 0.5, taxa_emolumentos: float = 0.03) -> Dict[str, Any]:
-    """Calcula custos operacionais estimados"""
+def _extrair_taxas_do_request(req) -> tuple:
+    """
+    Extrai taxas de corretagem e emolumentos do request
+    CORREÇÃO: Suporta formato separado, formato antigo e configurações complexas
+    Suporta:
+    - Taxas simples (float)
+    - Configurações com método (fixed/percentage) e valor
+    - Configurações por ativo
+    Retorna (taxa_corretagem, taxa_emolumentos) onde cada uma pode ser None ou um dict com método e valor
+    """
+    taxa_corretagem = None
+    taxa_emolumentos = None
+    
+    # Tentar extrair do form
+    taxa_corretagem_str = (req.form.get('taxa_corretagem') or 
+                          req.form.get('corretagem') or 
+                          req.form.get('brokerage') or
+                          req.form.get('backtest_commission'))
+    taxa_emolumentos_str = (req.form.get('taxa_emolumentos') or 
+                           req.form.get('emolumentos') or 
+                           req.form.get('emoluments') or
+                           req.form.get('backtest_fees'))
+    
+    # Tentar extrair do JSON
+    json_data = None
+    if req.is_json:
+        json_data = req.get_json(silent=True)
+        if json_data:
+            # Extrair corretagem do JSON
+            if not taxa_corretagem_str:
+                # Tentar diferentes formatos
+                if 'corretagem' in json_data:
+                    corretagem_data = json_data['corretagem']
+                    if isinstance(corretagem_data, dict):
+                        # Formato: {"method": "fixed", "value": 0.5}
+                        taxa_corretagem_str = str(corretagem_data.get('value', 0))
+                    else:
+                        taxa_corretagem_str = str(corretagem_data)
+                elif 'brokerage' in json_data:
+                    brokerage_data = json_data['brokerage']
+                    if isinstance(brokerage_data, dict):
+                        taxa_corretagem_str = str(brokerage_data.get('value', 0))
+                    else:
+                        taxa_corretagem_str = str(brokerage_data)
+                else:
+                    taxa_corretagem_str = (json_data.get('taxa_corretagem') or 
+                                          json_data.get('backtest_commission'))
+            
+            # Extrair emolumentos do JSON
+            if not taxa_emolumentos_str:
+                if 'emolumentos' in json_data:
+                    emolumentos_data = json_data['emolumentos']
+                    if isinstance(emolumentos_data, dict):
+                        taxa_emolumentos_str = str(emolumentos_data.get('value', 0))
+                    else:
+                        taxa_emolumentos_str = str(emolumentos_data)
+                elif 'emoluments' in json_data:
+                    emoluments_data = json_data['emoluments']
+                    if isinstance(emoluments_data, dict):
+                        taxa_emolumentos_str = str(emoluments_data.get('value', 0))
+                    else:
+                        taxa_emolumentos_str = str(emoluments_data)
+                else:
+                    taxa_emolumentos_str = (json_data.get('taxa_emolumentos') or 
+                                            json_data.get('backtest_fees'))
+    
+    # Converter para float se fornecido
+    if taxa_corretagem_str:
+        try:
+            taxa_corretagem = float(taxa_corretagem_str)
+            print(f"💼 Taxa de corretagem extraída do request: R$ {taxa_corretagem:.2f}")
+        except (ValueError, TypeError):
+            print(f"⚠️ Taxa de corretagem inválida: {taxa_corretagem_str}")
+    
+    if taxa_emolumentos_str:
+        try:
+            taxa_emolumentos = float(taxa_emolumentos_str)
+            print(f"💼 Taxa de emolumentos extraída do request: R$ {taxa_emolumentos:.2f}")
+        except (ValueError, TypeError):
+            print(f"⚠️ Taxa de emolumentos inválida: {taxa_emolumentos_str}")
+    
+    return taxa_corretagem, taxa_emolumentos
+
+def calcular_custos_operacionais(df: pd.DataFrame, taxa_corretagem: float = None, taxa_emolumentos: float = None) -> Dict[str, Any]:
+    """
+    Calcula custos operacionais estimados
+    CORREÇÃO: Separa corretamente corretagem e emolumentos
+    
+    Args:
+        df: DataFrame com trades
+        taxa_corretagem: Taxa de corretagem (por roda ou por trade, dependendo do valor)
+        taxa_emolumentos: Taxa de emolumentos (percentual ou fixa por roda, dependendo do valor)
+    """
     if df.empty:
         return {}
     
-    df_valid = df.dropna(subset=['entry_price', 'exit_price'])
+    # CORREÇÃO: Usar valores padrão se não fornecidos
+    if taxa_corretagem is None:
+        taxa_corretagem = 0.50  # R$ 0,50 por roda (padrão mercado brasileiro)
+    if taxa_emolumentos is None:
+        taxa_emolumentos = 0.03  # R$ 0,03 por roda (padrão mercado brasileiro)
+    
+    # CORREÇÃO: Verificar se as colunas existem antes de usar
+    required_cols = []
+    if 'entry_price' in df.columns and 'exit_price' in df.columns:
+        required_cols = ['entry_price', 'exit_price']
+    elif 'Preço Compra' in df.columns and 'Preço Venda' in df.columns:
+        # Usar colunas originais se não tiver as normalizadas
+        required_cols = ['Preço Compra', 'Preço Venda']
+    else:
+        # Se não tem colunas de preço, usar todas as linhas (assumir que são válidas)
+        df_valid = df.copy()
+        total_trades = len(df_valid)
+        # Retornar valores básicos sem cálculos de valor operado
+        quantidade_rodas = total_trades * 2  # Assumir 2 rodas por trade
+        custo_corretagem = quantidade_rodas * taxa_corretagem if taxa_corretagem < 1.0 else total_trades * taxa_corretagem
+        custo_emolumentos = quantidade_rodas * taxa_emolumentos
+        custo_total = custo_corretagem + custo_emolumentos
+        
+        return {
+            "total_trades": total_trades,
+            "quantidade_rodas": int(quantidade_rodas),
+            "valor_total_operado": 0.0,  # Não foi possível calcular
+            "custo_corretagem": round(custo_corretagem, 2),
+            "custo_emolumentos": round(custo_emolumentos, 2),
+            "custo_total": round(custo_total, 2),
+            "custo_por_trade": round(custo_total / total_trades, 2) if total_trades > 0 else 0.0
+        }
+    
+    df_valid = df.dropna(subset=required_cols)
     total_trades = len(df_valid)
     
-    # Calcular valor total operado
-    df_valid['valor_entrada'] = df_valid['entry_price'] * df_valid.get('quantity', 1)
-    df_valid['valor_saida'] = df_valid['exit_price'] * df_valid.get('quantity', 1)
-    valor_total_operado = (df_valid['valor_entrada'] + df_valid['valor_saida']).sum()
+    if total_trades == 0:
+        return {
+            "total_trades": 0,
+            "valor_total_operado": 0.0,
+            "custo_corretagem": 0.0,
+            "custo_emolumentos": 0.0,
+            "custo_total": 0.0,
+            "custo_por_trade": 0.0
+        }
     
-    # Custos estimados
-    custo_corretagem = total_trades * taxa_corretagem  # Taxa fixa por operação
-    custo_emolumentos = valor_total_operado * (taxa_emolumentos / 100)  # Taxa percentual
+    # Calcular quantidade de rodas
+    quantidade_rodas = 0
+    if 'quantity' in df_valid.columns:
+        quantidade_rodas = df_valid['quantity'].sum() * 2  # Entrada + saída
+    elif 'qty_buy' in df_valid.columns and 'qty_sell' in df_valid.columns:
+        quantidade_rodas = (df_valid['qty_buy'].sum() + df_valid['qty_sell'].sum())
+    elif 'Qtd Compra' in df_valid.columns and 'Qtd Venda' in df_valid.columns:
+        quantidade_rodas = (df_valid['Qtd Compra'].sum() + df_valid['Qtd Venda'].sum())
+    else:
+        # Fallback: assumir 2 rodas por trade (entrada + saída)
+        quantidade_rodas = total_trades * 2
+    
+    # Calcular valor total operado
+    # CORREÇÃO: Verificar se as colunas de preço existem antes de usar
+    has_entry_price = 'entry_price' in df_valid.columns
+    has_exit_price = 'exit_price' in df_valid.columns
+    has_preco_compra = 'Preço Compra' in df_valid.columns
+    has_preco_venda = 'Preço Venda' in df_valid.columns
+    
+    if has_entry_price and has_exit_price:
+        if 'position_size' in df_valid.columns:
+            valor_entrada = df_valid['entry_price'] * df_valid['position_size']
+            valor_saida = df_valid['exit_price'] * df_valid['position_size']
+        elif 'quantity' in df_valid.columns:
+            valor_entrada = df_valid['entry_price'] * df_valid['quantity']
+            valor_saida = df_valid['exit_price'] * df_valid['quantity']
+        else:
+            # Fallback: assumir 1 contrato
+            valor_entrada = df_valid['entry_price']
+            valor_saida = df_valid['exit_price']
+        valor_total_operado = float((valor_entrada + valor_saida).sum())
+    elif has_preco_compra and has_preco_venda:
+        # Usar colunas originais se não tiver as normalizadas
+        if 'Qtd Compra' in df_valid.columns:
+            valor_entrada = df_valid['Preço Compra'] * df_valid['Qtd Compra']
+            valor_saida = df_valid['Preço Venda'] * df_valid['Qtd Venda'] if 'Qtd Venda' in df_valid.columns else df_valid['Preço Venda'] * df_valid['Qtd Compra']
+        else:
+            valor_entrada = df_valid['Preço Compra']
+            valor_saida = df_valid['Preço Venda']
+        valor_total_operado = float((valor_entrada + valor_saida).sum())
+    else:
+        # Se não tem colunas de preço, não é possível calcular valor operado
+        valor_total_operado = 0.0
+    
+    # CORREÇÃO: Calcular corretagem (sempre por roda)
+    # Se taxa_corretagem < 1, é por roda. Se >= 1, pode ser por trade
+    if taxa_corretagem < 1.0:
+        # Taxa por roda
+        custo_corretagem = quantidade_rodas * taxa_corretagem
+    else:
+        # Taxa por trade (assumir que é o valor total para entrada + saída)
+        custo_corretagem = total_trades * taxa_corretagem
+    
+    # CORREÇÃO: Calcular emolumentos (pode ser percentual ou fixo por roda)
+    if taxa_emolumentos < 1.0:
+        # Se < 1, pode ser percentual (ex: 0.03 = 3%) ou fixo por roda (ex: 0.03 = R$ 0,03)
+        # Tentar calcular como percentual primeiro
+        if valor_total_operado > 0:
+            # Assumir que é percentual se o valor operado for grande
+            if valor_total_operado > 10000:
+                custo_emolumentos = valor_total_operado * (taxa_emolumentos / 100.0)
+            else:
+                # Se valor operado é pequeno, provavelmente é fixo por roda
+                custo_emolumentos = quantidade_rodas * taxa_emolumentos
+        else:
+            # Se não tem valor operado, usar por roda
+            custo_emolumentos = quantidade_rodas * taxa_emolumentos
+    else:
+        # Taxa fixa por roda (valores >= 1)
+        custo_emolumentos = quantidade_rodas * taxa_emolumentos
+    
     custo_total = custo_corretagem + custo_emolumentos
+    
+    print(f"💼 calcular_custos_operacionais: Corretagem: R$ {custo_corretagem:.2f} ({quantidade_rodas:.0f} rodas × R$ {taxa_corretagem:.2f}), Emolumentos: R$ {custo_emolumentos:.2f}")
     
     return {
         "total_trades": total_trades,
+        "quantidade_rodas": int(quantidade_rodas),
         "valor_total_operado": round(valor_total_operado, 2),
         "custo_corretagem": round(custo_corretagem, 2),
         "custo_emolumentos": round(custo_emolumentos, 2),
         "custo_total": round(custo_total, 2),
-        "custo_por_trade": round(custo_total / total_trades, 2) if total_trades > 0 else 0
+        "custo_por_trade": round(custo_total / total_trades, 2) if total_trades > 0 else 0.0
     }
 
 # ============ FUNÇÕES PARA MÉTRICAS DIÁRIAS ============
@@ -1236,13 +2046,34 @@ def calcular_metricas_principais(df: pd.DataFrame, taxa_juros_mensal: float = 0.
         # Usar o maior entre os dois métodos para ser conservador
         capital_inicial = max(capital_estimado, capital_por_drawdown)
     
-    # SHARPE RATIO CORRIGIDO - Usar mesma fórmula do FunCalculos.py
+    # SHARPE RATIO CORRIGIDO - Usar desvio padrão corretamente
     # Calcular retornos dos trades individuais (como no FunCalculos.py)
     returns = df_valid['pnl'].values
     mean_return = np.mean(returns) if len(returns) > 0 else 0
+    # CORREÇÃO: Usar desvio padrão amostral (ddof=1) para correção de Bessel
+    # Isso é importante para amostras pequenas (correção de viés)
     std_return = np.std(returns, ddof=1) if len(returns) > 1 else 0
-    cdi = 0.12  # Taxa anual (12% ao ano) - mesma do FunCalculos.py
-    sharpe_ratio = ((mean_return - cdi) / std_return) if std_return != 0 else 0
+    
+    # CORREÇÃO: Calcular métricas estatísticas adicionais usando desvio padrão
+    volatility = std_return
+    variance = np.var(returns, ddof=1) if len(returns) > 1 else 0
+    coefficient_of_variation = (volatility / abs(mean_return) * 100) if mean_return != 0 else 0
+    
+    # CORREÇÃO: Ajustar CDI para o período dos retornos
+    # CDI é anual (12%), mas retornos são por trade
+    # Ajustamos proporcionalmente ao número de trades no período
+    cdi_annual = 0.12  # Taxa anual (12% ao ano)
+    # Para retornos por trade, ajustamos o CDI baseado no número de trades
+    # Assumindo ~252 dias úteis por ano e média de trades por dia
+    if days_traded > 0:
+        trades_per_day = total_trades / days_traded
+        # Ajustar CDI para retorno por trade: CDI_por_trade = CDI_anual / (252 * trades_por_dia)
+        # Simplificado: usar CDI diretamente se não temos informação suficiente
+        cdi = cdi_annual / 252 if trades_per_day > 0 else cdi_annual
+    else:
+        cdi = cdi_annual
+    
+    sharpe_ratio = ((mean_return - cdi) / std_return) if std_return > 0 else 0
     
     # Fator de Recuperação
     recovery_factor = total_pnl / max_drawdown if max_drawdown != 0 else 0
@@ -1284,6 +2115,9 @@ def calcular_metricas_principais(df: pd.DataFrame, taxa_juros_mensal: float = 0.
     return {
         "metricas_principais": {
             "sharpe_ratio": round(sharpe_ratio, 2),  # PADRONIZADO - mesma fórmula do FunCalculos.py
+            "volatilidade": round(volatility, 2),
+            "variancia": round(variance, 2),
+            "coeficiente_variacao": round(coefficient_of_variation, 2),
             "fator_recuperacao": round(recovery_factor, 2),
             "drawdown_maximo": round(-max_drawdown, 2),  # Negativo para compatibilidade
             "drawdown_maximo_pct": round(max_drawdown_pct, 2),
@@ -2034,39 +2868,16 @@ def api_tabela_multipla():
         if not dataframes:
             return jsonify({"error": "Nenhum arquivo enviado. Use 'file' para um arquivo ou 'files' para múltiplos"}), 400
         
-        # Aplicar filtros opcionais
+        # CORREÇÃO: Extrair filtros ANTES de processar
         filtros = _parse_filters_from_request(request)
-        if filtros:
-            df = aplicar_filtros_basicos(df, filtros)
-            df = df.reset_index(drop=True)
-
+        print(f"🔍 Filtros recebidos: {filtros}")
+        
         # Parâmetros opcionais
         capital_inicial = float(request.form.get('capital_inicial', 100000))
         cdi = float(request.form.get('cdi', 0.12))
         
-        # CORREÇÃO: Suporte para taxas customizadas de corretagem e emolumentos
-        # Permite que o frontend envie taxas customizadas que serão aplicadas nos cálculos
-        taxa_corretagem = request.form.get('taxa_corretagem') or request.form.get('backtest_commission')
-        taxa_emolumentos = request.form.get('taxa_emolumentos') or request.form.get('backtest_fees')
-        
-        # Se não foram fornecidas, usar None para que o backend use cálculo automático
-        if taxa_corretagem:
-            try:
-                taxa_corretagem = float(taxa_corretagem)
-                print(f"💼 Taxa de corretagem customizada recebida: R$ {taxa_corretagem:.2f} por roda")
-            except:
-                taxa_corretagem = None
-        else:
-            taxa_corretagem = None
-        
-        if taxa_emolumentos:
-            try:
-                taxa_emolumentos = float(taxa_emolumentos)
-                print(f"💼 Taxa de emolumentos customizada recebida: R$ {taxa_emolumentos:.2f} por roda")
-            except:
-                taxa_emolumentos = None
-        else:
-            taxa_emolumentos = None
+        # CORREÇÃO: Extrair taxas usando função auxiliar
+        taxa_corretagem, taxa_emolumentos = _extrair_taxas_do_request(request)
         
         # Processar cada arquivo individualmente
         resultados_individuais = {}
@@ -2249,6 +3060,28 @@ def api_tabela_multipla():
                     else:
                         print(f"     ✅ entry_date recriado com sucesso! Continuando processamento...")
 
+                # CORREÇÃO CRÍTICA: Aplicar filtros ANTES de processar
+                # Os filtros devem ser aplicados após normalização mas antes de processar
+                if filtros:
+                    print(f"     🔍 Aplicando filtros ao arquivo {nome_arquivo}...")
+                    df_antes_filtro = len(df)
+                    df = aplicar_filtros_basicos(df, filtros)
+                    df = df.reset_index(drop=True)
+                    df_depois_filtro = len(df)
+                    print(f"     ✅ Filtros aplicados: {df_antes_filtro} -> {df_depois_filtro} registros")
+                    
+                    # Se após filtros o DataFrame ficou vazio, pular este arquivo
+                    if df.empty:
+                        print(f"     ⚠️ DataFrame ficou vazio após aplicar filtros. Pulando arquivo {nome_arquivo}.")
+                        resultados_individuais[nome_arquivo] = {
+                            "error": "Nenhum registro corresponde aos filtros aplicados.",
+                            "info_arquivo": {
+                                "nome_arquivo": nome_arquivo,
+                                "total_registros_antes_filtro": df_antes_filtro
+                            }
+                        }
+                        continue
+
                 # CORREÇÃO: Passar taxas customizadas para processar_backtest_completo
                 # Se taxas foram fornecidas, passá-las. Caso contrário, None (cálculo automático)
                 resultado_individual = processar_backtest_completo(
@@ -2363,6 +3196,15 @@ def api_tabela_multipla():
             pnl_valid = df_consolidado['pnl'].notna().sum() if 'pnl' in df_consolidado.columns else 0
             print(f"   ✅ DataFrame consolidado normalizado: entry_date válidos: {entry_date_valid}/{len(df_consolidado)}, pnl válidos: {pnl_valid}/{len(df_consolidado)}")
             print(f"      Colunas depois: {list(df_consolidado.columns)[:15]}...")
+        
+        # CORREÇÃO CRÍTICA: Aplicar filtros no DataFrame consolidado ANTES de processar
+        if filtros:
+            print(f"   🔍 Aplicando filtros ao DataFrame consolidado...")
+            df_consolidado_antes = len(df_consolidado)
+            df_consolidado = aplicar_filtros_basicos(df_consolidado, filtros)
+            df_consolidado = df_consolidado.reset_index(drop=True)
+            df_consolidado_depois = len(df_consolidado)
+            print(f"   ✅ Filtros aplicados ao consolidado: {df_consolidado_antes} -> {df_consolidado_depois} registros")
         
         # CORREÇÃO: Passar taxas customizadas também para o consolidado
         resultado_consolidado = processar_backtest_completo(
@@ -2592,8 +3434,41 @@ def api_tabela():
         for i, df in enumerate(dataframes):
             print(f"🔍 DEBUG: DataFrame {i}: shape={df.shape}, columns={df.columns.tolist()}")
         
-        # Concatenar todos os DataFrames em um só
-        df_consolidado = pd.concat(dataframes, ignore_index=True)
+        # CORREÇÃO CRÍTICA: Normalizar CADA DataFrame individualmente antes de concatenar
+        # Isso garante que todos tenham entry_date e pnl no formato correto
+        from FunCalculos import _normalize_trades_dataframe
+        dataframes_normalizados = []
+        for i, df in enumerate(dataframes):
+            print(f"🔄 api_tabela: Normalizando DataFrame {i+1}/{len(dataframes)}...")
+            df_original_len = len(df)
+            df_normalized = _normalize_trades_dataframe(df)
+            if df_normalized.empty:
+                print(f"   ⚠️ DataFrame {i+1} ficou vazio após normalização (tinha {df_original_len} linhas)")
+            else:
+                entry_date_valid = df_normalized['entry_date'].notna().sum() if 'entry_date' in df_normalized.columns else 0
+                pnl_valid = df_normalized['pnl'].notna().sum() if 'pnl' in df_normalized.columns else 0
+                print(f"   ✅ DataFrame {i+1} normalizado: entry_date válidos: {entry_date_valid}/{len(df_normalized)}, pnl válidos: {pnl_valid}/{len(df_normalized)}")
+            dataframes_normalizados.append(df_normalized)
+        
+        # Concatenar todos os DataFrames normalizados em um só
+        df_consolidado = pd.concat(dataframes_normalizados, ignore_index=True)
+        
+        # Validar que temos dados após normalização
+        if df_consolidado.empty:
+            return jsonify({"error": "Após normalização, todos os arquivos ficaram vazios. Verifique se há dados válidos nas colunas 'Abertura' e de resultado."}), 400
+        
+        # Validar colunas obrigatórias
+        if 'entry_date' not in df_consolidado.columns:
+            return jsonify({"error": "Não foi possível criar coluna 'entry_date'. Verifique se o arquivo contém a coluna 'Abertura' com datas válidas."}), 400
+        
+        if 'pnl' not in df_consolidado.columns:
+            return jsonify({"error": "Não foi possível criar coluna 'pnl'. Verifique se o arquivo contém coluna de resultado (Res. Intervalo, Res. Operação, etc.)."}), 400
+        
+        # CORREÇÃO: Aplicar filtros de período personalizado
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df_consolidado = aplicar_filtros_basicos(df_consolidado, filtros)
+            df_consolidado = df_consolidado.reset_index(drop=True)
         
         # Parâmetros opcionais
         capital_inicial = float(request.form.get('capital_inicial', 100000))
@@ -2656,6 +3531,12 @@ def api_equity_curve():
         else:
             return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
 
+        # CORREÇÃO: Aplicar filtros de período personalizado
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df = aplicar_filtros_basicos(df, filtros)
+            df = df.reset_index(drop=True)
+
         # Parâmetros opcionais
         capital_inicial = float(request.form.get('capital_inicial', 100000))
         tipo_agrupamento = request.form.get('tipo', 'daily')  # 'trade', 'daily', 'weekly', 'monthly'
@@ -2697,31 +3578,18 @@ def api_backtest_completo():
         else:
             return jsonify({"error": "Envie um arquivo ou caminho via POST"}), 400
 
+        # CORREÇÃO: Aplicar filtros de período personalizado
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df = aplicar_filtros_basicos(df, filtros)
+            df = df.reset_index(drop=True)
+
         # Parâmetros opcionais
         capital_inicial = float(request.form.get('capital_inicial', 100000))
         cdi = float(request.form.get('cdi', 0.12))
         
-        # CORREÇÃO: Suporte para taxas customizadas de corretagem e emolumentos
-        taxa_corretagem = request.form.get('taxa_corretagem') or request.form.get('backtest_commission')
-        taxa_emolumentos = request.form.get('taxa_emolumentos') or request.form.get('backtest_fees')
-        
-        if taxa_corretagem:
-            try:
-                taxa_corretagem = float(taxa_corretagem)
-                print(f"💼 api_backtest_completo: Taxa de corretagem customizada: R$ {taxa_corretagem:.2f} por roda")
-            except:
-                taxa_corretagem = None
-        else:
-            taxa_corretagem = None
-        
-        if taxa_emolumentos:
-            try:
-                taxa_emolumentos = float(taxa_emolumentos)
-                print(f"💼 api_backtest_completo: Taxa de emolumentos customizada: R$ {taxa_emolumentos:.2f} por roda")
-            except:
-                taxa_emolumentos = None
-        else:
-            taxa_emolumentos = None
+        # CORREÇÃO: Extrair taxas usando função auxiliar
+        taxa_corretagem, taxa_emolumentos = _extrair_taxas_do_request(request)
         
         # Usar a função completa com taxas customizadas
         resultado = processar_backtest_completo(
@@ -2851,46 +3719,148 @@ def api_hourly_results():
         df_consolidado = pd.concat(dataframes, ignore_index=True)
         
         # CORREÇÃO: Normalizar antes de processar
-        from FunCalculos import _normalize_trades_dataframe
+        from FunCalculos import _normalize_trades_dataframe, _detect_pnl_column
         if 'entry_date' not in df_consolidado.columns or 'pnl' not in df_consolidado.columns:
             df_consolidado = _normalize_trades_dataframe(df_consolidado)
             if df_consolidado.empty:
                 return jsonify({"error": "Após normalização, o arquivo ficou vazio."}), 400
         
         # Validar colunas necessárias
-        if 'entry_date' not in df_consolidado.columns or 'pnl' not in df_consolidado.columns:
-            return jsonify({"error": "Colunas obrigatórias (entry_date, pnl) não encontradas"}), 400
+        if 'entry_date' not in df_consolidado.columns:
+            return jsonify({"error": "Coluna obrigatória 'entry_date' não encontrada"}), 400
+        
+        # CORREÇÃO: Detectar coluna de PnL corretamente
+        pnl_col = _detect_pnl_column(df_consolidado)
+        if pnl_col is None:
+            return jsonify({"error": "Coluna de PnL não encontrada"}), 400
+        
+        # CORREÇÃO: Aplicar filtros de período personalizado
+        filtros = _parse_filters_from_request(request)
+        if filtros:
+            df_consolidado = aplicar_filtros_basicos(df_consolidado, filtros)
+            df_consolidado = df_consolidado.reset_index(drop=True)
         
         # Filtrar dados válidos
-        df_valid = df_consolidado.dropna(subset=['entry_date', 'pnl']).copy()
+        df_valid = df_consolidado.dropna(subset=['entry_date', pnl_col]).copy()
         if df_valid.empty:
-            return jsonify({"error": "Nenhum dado válido encontrado"}), 400
+            return jsonify({"error": "Nenhum dado válido encontrado após filtros"}), 400
         
-        # Extrair hora da entrada
-        df_valid['hour'] = pd.to_datetime(df_valid['entry_date']).dt.hour
+        # Garantir que entry_date é datetime
+        df_valid['entry_date'] = pd.to_datetime(df_valid['entry_date'], errors='coerce')
+        df_valid = df_valid[df_valid['entry_date'].notna()].copy()
         
-        # Agrupar por hora
-        hourly_stats = df_valid.groupby('hour').agg({
-            'pnl': ['sum', 'mean', 'count'],
-        }).round(2)
+        if df_valid.empty:
+            return jsonify({"error": "Nenhuma data válida encontrada"}), 400
         
-        hourly_stats.columns = ['total_pnl', 'avg_pnl', 'total_trades']
+        # Extrair hora e minutos da entrada para processar períodos customizados
+        df_valid['hour'] = df_valid['entry_date'].dt.hour
+        df_valid['minute'] = df_valid['entry_date'].dt.minute
+        df_valid['total_minutes'] = df_valid['hour'] * 60 + df_valid['minute']
         
-        # Converter para dicionário
+        # Processar períodos customizados se fornecidos
+        custom_periods = []
+        custom_periods_str = request.form.get('custom_periods')
+        if custom_periods_str:
+            try:
+                import json
+                custom_periods = json.loads(custom_periods_str)
+            except:
+                pass
+        
+        # Se não há períodos customizados, usar períodos padrão
+        if not custom_periods:
+            custom_periods = [
+                {"start": "09:00", "end": "11:00", "label": "Abertura"},
+                {"start": "11:00", "end": "14:00", "label": "Meio-dia"},
+                {"start": "14:00", "end": "17:30", "label": "Tarde"},
+                {"start": "17:30", "end": "21:00", "label": "Pós-mercado"}
+            ]
+        
+        # Processar cada período customizado
+        period_results = []
+        for period in custom_periods:
+            start_time = period.get('start', '09:00')
+            end_time = period.get('end', '11:00')
+            label = period.get('label', f"{start_time} - {end_time}")
+            
+            # Converter horários para minutos
+            start_hour, start_min = map(int, start_time.split(':'))
+            end_hour, end_min = map(int, end_time.split(':'))
+            start_minutes = start_hour * 60 + start_min
+            end_minutes = end_hour * 60 + end_min
+            
+            # Filtrar trades dentro do período
+            if start_minutes <= end_minutes:
+                # Período normal (não cruza meia-noite)
+                period_trades = df_valid[
+                    (df_valid['total_minutes'] >= start_minutes) & 
+                    (df_valid['total_minutes'] < end_minutes)
+                ]
+            else:
+                # Período que cruza meia-noite
+                period_trades = df_valid[
+                    (df_valid['total_minutes'] >= start_minutes) | 
+                    (df_valid['total_minutes'] < end_minutes)
+                ]
+            
+            # Sempre adicionar o período, mesmo que não tenha trades
+            total_trades = len(period_trades)
+            
+            if total_trades > 0:
+                # Calcular métricas do período quando há trades
+                total_pnl = float(period_trades[pnl_col].sum())
+                winning_trades = period_trades[period_trades[pnl_col] > 0]
+                losing_trades = period_trades[period_trades[pnl_col] < 0]
+                win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0
+                
+                gross_profit = float(winning_trades[pnl_col].sum()) if len(winning_trades) > 0 else 0.0
+                gross_loss = abs(float(losing_trades[pnl_col].sum())) if len(losing_trades) > 0 else 0.0
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.99 if gross_profit > 0 else 0.0)
+                
+                avg_win = round(gross_profit / len(winning_trades), 2) if len(winning_trades) > 0 else 0.0
+                avg_loss = round(gross_loss / len(losing_trades), 2) if len(losing_trades) > 0 else 0.0
+            else:
+                # Período sem trades - valores zerados
+                total_pnl = 0.0
+                win_rate = 0.0
+                profit_factor = 0.0
+                avg_win = 0.0
+                avg_loss = 0.0
+            
+            # Sempre adicionar o período à lista de resultados
+            period_results.append({
+                "period": f"{start_time}-{end_time}",
+                "label": label,
+                "trades": total_trades,
+                "pnl_total": round(total_pnl, 2),
+                "win_rate": round(win_rate, 1),
+                "profit_factor": round(profit_factor, 2),
+                "avg_win": avg_win,
+                "avg_loss": avg_loss
+            })
+        
+        # Calcular resumo
+        total_pnl = sum(r['pnl_total'] for r in period_results)
+        # Melhor e pior período apenas entre os que têm trades
+        periods_with_trades = [r for r in period_results if r['trades'] > 0]
+        best_period = max(periods_with_trades, key=lambda x: x['pnl_total']) if periods_with_trades else None
+        worst_period = min(periods_with_trades, key=lambda x: x['pnl_total']) if periods_with_trades else None
+        
+        # Retornar no formato esperado pelo frontend
         resultado = {
-            "hourly_results": [
-                {
-                    "hour": int(hour),
-                    "total_pnl": float(row['total_pnl']),
-                    "avg_pnl": float(row['avg_pnl']),
-                    "total_trades": int(row['total_trades'])
-                }
-                for hour, row in hourly_stats.iterrows()
-            ],
+            "summary": {
+                "total_periods": len(period_results),  # Total de períodos configurados (incluindo sem trades)
+                "total_pnl": round(total_pnl, 2),
+                "best_period": best_period,
+                "worst_period": worst_period
+            },
+            "results": period_results,
+            "custom_periods": custom_periods,
             "info_arquivos": {
                 "total_arquivos": len(arquivos_processados),
                 "nomes_arquivos": arquivos_processados,
-                "total_registros": len(df_consolidado)
+                "total_registros": len(df_consolidado),
+                "registros_apos_filtros": len(df_valid)
             }
         }
         
@@ -2926,6 +3896,9 @@ def api_admin_events():
             status = request.args.get('status')
             date_from = request.args.get('date_from')
             date_to = request.args.get('date_to')
+            special_only = request.args.get('special_only', 'false').lower() == 'true'
+            event_category = request.args.get('event_category')  # Para eventos especiais
+            event_date = request.args.get('event_date')  # Data do evento especial
             
             filtered_events = _events_storage.copy()
             
@@ -2936,6 +3909,32 @@ def api_admin_events():
             if status:
                 filtered_events = [e for e in filtered_events if e.get('status') == status]
             
+            # Filtro para eventos especiais
+            if special_only:
+                filtered_events = [e for e in filtered_events if e.get('is_special', False)]
+            
+            # Filtro por categoria de evento especial
+            if event_category:
+                filtered_events = [
+                    e for e in filtered_events 
+                    if e.get('is_special', False) and 
+                    e.get('special_event', {}).get('event_category') == event_category
+                ]
+            
+            # Filtro por data do evento especial
+            if event_date:
+                try:
+                    event_date_dt = pd.to_datetime(event_date).date()
+                    filtered_events = [
+                        e for e in filtered_events
+                        if e.get('is_special', False) and
+                        e.get('special_event', {}).get('event_date') and
+                        pd.to_datetime(e.get('special_event', {}).get('event_date')).date() == event_date_dt
+                    ]
+                except:
+                    pass
+            
+            # Filtro por data de criação
             if date_from:
                 try:
                     date_from_dt = pd.to_datetime(date_from)
@@ -2956,12 +3955,21 @@ def api_admin_events():
                 except:
                     pass
             
-            # Ordenar por data (mais recente primeiro)
-            filtered_events.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+            # Ordenar por data (mais recente primeiro) ou por data do evento especial se for especial
+            def sort_key(event):
+                if event.get('is_special', False) and event.get('special_event', {}).get('event_date'):
+                    try:
+                        return pd.to_datetime(event.get('special_event', {}).get('event_date'))
+                    except:
+                        return pd.to_datetime(event.get('created_at', ''))
+                return pd.to_datetime(event.get('created_at', ''))
+            
+            filtered_events.sort(key=sort_key, reverse=True)
             
             return jsonify({
                 "events": filtered_events,
                 "total": len(filtered_events),
+                "special_count": len([e for e in filtered_events if e.get('is_special', False)]),
                 "message": "Eventos listados com sucesso"
             })
         
@@ -2978,19 +3986,50 @@ def api_admin_events():
                     "error": f"Campos obrigatórios faltando: {', '.join(missing_fields)}"
                 }), 400
             
-            # Criar evento
+            # Verificar se é evento especial
+            is_special = data.get('is_special', False) or data.get('special', False)
+            if isinstance(is_special, str):
+                is_special = is_special.lower() in ('true', '1', 'yes', 'sim')
+            
+            # Criar evento base
             new_event = {
                 "id": _event_id_counter,
                 "title": data.get('title'),
-                "type": data.get('type'),  # 'info', 'warning', 'error', 'success', 'maintenance'
+                "type": data.get('type'),  # 'info', 'warning', 'error', 'success', 'maintenance', 'special'
                 "description": data.get('description'),
                 "status": data.get('status', 'active'),  # 'active', 'resolved', 'archived'
                 "priority": data.get('priority', 'medium'),  # 'low', 'medium', 'high', 'critical'
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
                 "created_by": data.get('created_by', 'system'),
-                "metadata": data.get('metadata', {})
+                "metadata": data.get('metadata', {}),
+                "is_special": is_special
             }
+            
+            # Adicionar campos específicos para eventos especiais
+            if is_special:
+                # Processar array de datas se fornecido
+                dates = data.get('dates', [])
+                if dates and isinstance(dates, list) and len(dates) > 0:
+                    # Se há múltiplas datas, usar a primeira como event_date e salvar todas em dates
+                    new_event["dates"] = dates
+                    event_date = dates[0] if dates else (data.get('event_date') or data.get('data_ocorrencia'))
+                else:
+                    # Se não há array, usar event_date ou date
+                    event_date = data.get('event_date') or data.get('date') or data.get('data_ocorrencia')
+                    new_event["dates"] = [event_date] if event_date else []
+                
+                new_event["special_event"] = {
+                    "event_date": event_date,  # Data do evento especial (primeira data se múltiplas)
+                    "event_category": data.get('event_category') or data.get('categoria', 'market'),  # 'market', 'holiday', 'economic', 'corporate', 'other'
+                    "impact": data.get('impact', 'medium'),  # 'low', 'medium', 'high', 'critical'
+                    "market_affected": data.get('market_affected', []),  # Lista de mercados afetados
+                    "recurring": data.get('recurring', False),  # Se é evento recorrente (ex: feriados)
+                    "recurrence_pattern": data.get('recurrence_pattern'),  # 'yearly', 'monthly', 'weekly', etc.
+                    "tags": data.get('tags', []),  # Tags para categorização
+                    "related_events": data.get('related_events', []),  # IDs de eventos relacionados
+                    "notes": data.get('notes', '')  # Notas adicionais sobre o evento
+                }
             
             _events_storage.append(new_event)
             _event_id_counter += 1
@@ -3024,10 +4063,33 @@ def api_admin_events():
                 return jsonify({"error": "Evento não encontrado"}), 404
             
             # Atualizar campos permitidos
-            allowed_fields = ['title', 'type', 'description', 'status', 'priority', 'metadata']
+            allowed_fields = ['title', 'type', 'description', 'status', 'priority', 'metadata', 'is_special', 'special']
             for field in allowed_fields:
                 if field in data:
-                    _events_storage[event_index][field] = data[field]
+                    if field == 'special':
+                        _events_storage[event_index]['is_special'] = data[field]
+                    else:
+                        _events_storage[event_index][field] = data[field]
+            
+            # Atualizar campos de evento especial se for especial
+            if data.get('is_special') or data.get('special') or _events_storage[event_index].get('is_special', False):
+                if 'special_event' not in _events_storage[event_index]:
+                    _events_storage[event_index]['special_event'] = {}
+                
+                special_fields = [
+                    'event_date', 'data_ocorrencia', 'event_category', 'categoria',
+                    'impact', 'market_affected', 'recurring', 'recurrence_pattern',
+                    'tags', 'related_events', 'notes'
+                ]
+                
+                for field in special_fields:
+                    if field in data:
+                        if field == 'data_ocorrencia':
+                            _events_storage[event_index]['special_event']['event_date'] = data[field]
+                        elif field == 'categoria':
+                            _events_storage[event_index]['special_event']['event_category'] = data[field]
+                        else:
+                            _events_storage[event_index]['special_event'][field] = data[field]
             
             _events_storage[event_index]['updated_at'] = datetime.now().isoformat()
             
@@ -3070,6 +4132,244 @@ def api_admin_events():
         import traceback
         traceback.print_exc()
         return jsonify({"error": f"Erro ao processar eventos: {str(e)}"}), 500
+
+
+@app.route('/api/admin/events/special', methods=['GET', 'POST'])
+def api_admin_events_special():
+    """
+    Endpoint específico para eventos especiais
+    GET: Lista apenas eventos especiais (com filtros opcionais)
+    POST: Cria novo evento especial
+    """
+    global _events_storage, _event_id_counter
+    
+    try:
+        if request.method == 'GET':
+            # Listar apenas eventos especiais com filtros opcionais
+            event_category = request.args.get('event_category')
+            event_date_from = request.args.get('event_date_from')
+            event_date_to = request.args.get('event_date_to')
+            impact = request.args.get('impact')
+            recurring = request.args.get('recurring')
+            
+            # Filtrar apenas eventos especiais
+            special_events = [e for e in _events_storage if e.get('is_special', False)]
+            
+            # Aplicar filtros específicos
+            if event_category:
+                special_events = [
+                    e for e in special_events
+                    if e.get('special_event', {}).get('event_category') == event_category
+                ]
+            
+            if impact:
+                special_events = [
+                    e for e in special_events
+                    if e.get('special_event', {}).get('impact') == impact
+                ]
+            
+            if recurring:
+                recurring_bool = recurring.lower() == 'true'
+                special_events = [
+                    e for e in special_events
+                    if e.get('special_event', {}).get('recurring') == recurring_bool
+                ]
+            
+            # Filtro por data do evento
+            if event_date_from:
+                try:
+                    date_from_dt = pd.to_datetime(event_date_from)
+                    special_events = [
+                        e for e in special_events
+                        if e.get('special_event', {}).get('event_date') and
+                        pd.to_datetime(e.get('special_event', {}).get('event_date')) >= date_from_dt
+                    ]
+                except:
+                    pass
+            
+            if event_date_to:
+                try:
+                    date_to_dt = pd.to_datetime(event_date_to)
+                    special_events = [
+                        e for e in special_events
+                        if e.get('special_event', {}).get('event_date') and
+                        pd.to_datetime(e.get('special_event', {}).get('event_date')) <= date_to_dt
+                    ]
+                except:
+                    pass
+            
+            # Ordenar por data do evento especial
+            def sort_key(event):
+                if event.get('special_event', {}).get('event_date'):
+                    try:
+                        return pd.to_datetime(event.get('special_event', {}).get('event_date'))
+                    except:
+                        return pd.to_datetime(event.get('created_at', ''))
+                return pd.to_datetime(event.get('created_at', ''))
+            
+            special_events.sort(key=sort_key, reverse=True)
+            
+            # Normalizar eventos para facilitar uso no frontend
+            normalized_events = []
+            for event in special_events:
+                special_event_data = event.get('special_event', {})
+                # Extrair todas as datas do evento (pode estar em dates, date, ou event_date)
+                event_dates = event.get('dates', []) or event.get('datas', [])
+                if not event_dates:
+                    # Se não há array de dates, usar event_date como array com um elemento
+                    event_date = special_event_data.get('event_date') or event.get('date')
+                    event_dates = [event_date] if event_date else []
+                
+                normalized_event = {
+                    "id": event.get('id'),
+                    "title": event.get('title'),
+                    "name": event.get('title'),  # Alias para compatibilidade
+                    "date": event_dates[0] if event_dates else (special_event_data.get('event_date') or event.get('created_at')),
+                    "dates": event_dates,  # Array com todas as datas
+                    "event_date": special_event_data.get('event_date') or (event_dates[0] if event_dates else None),
+                    "data_ocorrencia": special_event_data.get('event_date') or (event_dates[0] if event_dates else None),
+                    "impact": special_event_data.get('impact', 'medium'),
+                    "description": event.get('description') or special_event_data.get('notes', ''),
+                    "descricao": event.get('description') or special_event_data.get('notes', ''),
+                    "event_category": special_event_data.get('event_category', 'market'),
+                    "categoria": special_event_data.get('event_category', 'market'),
+                    "market_affected": special_event_data.get('market_affected', []),
+                    "mercados_afetados": special_event_data.get('market_affected', []),
+                    "recurring": special_event_data.get('recurring', False),
+                    "recorrente": special_event_data.get('recurring', False),
+                    "recurrence_pattern": special_event_data.get('recurrence_pattern'),
+                    "padrao_recorrencia": special_event_data.get('recurrence_pattern'),
+                    "tags": special_event_data.get('tags', []),
+                    "etiquetas": special_event_data.get('tags', []),
+                    "created_at": event.get('created_at'),
+                    "updated_at": event.get('updated_at'),
+                    # Manter estrutura original para compatibilidade
+                    "special_event": special_event_data,
+                    "is_special": True
+                }
+                normalized_events.append(normalized_event)
+            
+            # Agrupar por categoria para estatísticas
+            categories = {}
+            for event in special_events:
+                cat = event.get('special_event', {}).get('event_category', 'other')
+                categories[cat] = categories.get(cat, 0) + 1
+            
+            return jsonify({
+                "events": normalized_events,
+                "total": len(normalized_events),
+                "statistics": {
+                    "by_category": categories,
+                    "by_impact": {
+                        impact: len([e for e in special_events if e.get('special_event', {}).get('impact') == impact])
+                        for impact in ['low', 'medium', 'high', 'critical']
+                    },
+                    "recurring_count": len([e for e in special_events if e.get('special_event', {}).get('recurring', False)])
+                },
+                "message": "Eventos especiais listados com sucesso"
+            })
+        
+        elif request.method == 'POST':
+            # Criar novo evento especial
+            data = request.get_json() if request.is_json else request.form.to_dict()
+            
+            # Validar campos obrigatórios para evento especial
+            required_fields = ['title', 'description', 'event_date']
+            missing_fields = [
+        field for field in required_fields 
+        if (field == 'event_date' and not data.get(field) and not data.get('data_ocorrencia')) 
+        or (field != 'event_date' and not data.get(field))
+    ]
+            
+            if missing_fields:
+                return jsonify({
+                    "error": f"Campos obrigatórios faltando: {', '.join(missing_fields)}"
+                }), 400
+            
+            # Criar evento especial
+            new_event = {
+                "id": _event_id_counter,
+                "title": data.get('title'),
+                "type": data.get('type', 'special'),
+                "description": data.get('description'),
+                "status": data.get('status', 'active'),
+                "priority": data.get('priority', 'medium'),
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "created_by": data.get('created_by', 'system'),
+                "metadata": data.get('metadata', {}),
+                "is_special": True,
+                "special_event": {
+                    "event_date": data.get('event_date') or data.get('data_ocorrencia'),
+                    "event_category": data.get('event_category') or data.get('categoria', 'market'),
+                    "impact": data.get('impact', 'medium'),
+                    "market_affected": data.get('market_affected', []),
+                    "recurring": data.get('recurring', False),
+                    "recurrence_pattern": data.get('recurrence_pattern'),
+                    "tags": data.get('tags', []),
+                    "related_events": data.get('related_events', []),
+                    "notes": data.get('notes', '')
+                }
+            }
+            
+            _events_storage.append(new_event)
+            _event_id_counter += 1
+            
+            return jsonify({
+                "message": "Evento especial criado com sucesso",
+                "event": new_event
+            }), 201
+        
+    except Exception as e:
+        print(f"❌ Erro ao processar eventos especiais: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erro ao processar eventos especiais: {str(e)}"}), 500
+
+
+@app.route('/api/admin/events/upcoming-special', methods=['GET'])
+def api_admin_events_upcoming_special():
+    """
+    Endpoint para listar eventos especiais futuros (próximos eventos)
+    """
+    global _events_storage
+    
+    try:
+        days_ahead = int(request.args.get('days', 30))  # Próximos 30 dias por padrão
+        
+        now = datetime.now()
+        future_date = now + timedelta(days=days_ahead)
+        
+        # Filtrar eventos especiais futuros
+        upcoming_events = []
+        for event in _events_storage:
+            if not event.get('is_special', False):
+                continue
+            
+            event_date_str = event.get('special_event', {}).get('event_date')
+            if not event_date_str:
+                continue
+            
+            try:
+                event_date = pd.to_datetime(event_date_str)
+                if now <= event_date <= future_date and event.get('status') == 'active':
+                    upcoming_events.append(event)
+            except:
+                continue
+        
+        # Ordenar por data do evento
+        upcoming_events.sort(key=lambda x: pd.to_datetime(x.get('special_event', {}).get('event_date', '')))
+        
+        return jsonify({
+            "events": upcoming_events,
+            "total": len(upcoming_events),
+            "days_ahead": days_ahead,
+            "message": f"Próximos {len(upcoming_events)} eventos especiais nos próximos {days_ahead} dias"
+        })
+        
+    except Exception as e:
+        print(f"❌ Erro ao buscar eventos especiais futuros: {e}")
+        return jsonify({"error": f"Erro ao buscar eventos especiais futuros: {str(e)}"}), 500
 
 
 # ============ SISTEMA DE MAILING ============
@@ -3360,8 +4660,12 @@ def api_trades():
     """Endpoint principal para análise de trades - suporta arquivo único ou múltiplos arquivos"""
     try:
         # Obter parâmetros opcionais
-        taxa_corretagem = float(request.form.get('taxa_corretagem', 0.5))
-        taxa_emolumentos = float(request.form.get('taxa_emolumentos', 0.03))
+        # CORREÇÃO: Extrair taxas usando função auxiliar (com defaults)
+        taxa_corretagem, taxa_emolumentos = _extrair_taxas_do_request(request)
+        if taxa_corretagem is None:
+            taxa_corretagem = 0.5  # Default: R$ 0,50 por roda
+        if taxa_emolumentos is None:
+            taxa_emolumentos = 0.03  # Default: R$ 0,03 por roda
         
         # Lista para armazenar todos os DataFrames
         dataframes = []
@@ -3403,9 +4707,20 @@ def api_trades():
         
         # Concatenar todos os DataFrames em um só
         df_consolidado = pd.concat(dataframes, ignore_index=True)
+        
+        # CORREÇÃO: Normalizar ANTES de aplicar filtros para garantir colunas corretas
+        from FunCalculos import _normalize_trades_dataframe
+        print(f"🔄 Normalizando DataFrame consolidado antes de aplicar filtros...")
+        df_consolidado = _normalize_trades_dataframe(df_consolidado)
+        
+        if df_consolidado.empty:
+            return jsonify({"error": "Após normalização, todos os arquivos ficaram vazios."}), 400
 
+        # CORREÇÃO: Aplicar filtros APÓS normalização
         if filtros:
+            print(f"🔍 Aplicando filtros ao DataFrame consolidado (shape antes: {df_consolidado.shape})...")
             df_consolidado = aplicar_filtros_basicos(df_consolidado, filtros)
+            print(f"✅ Filtros aplicados (shape depois: {df_consolidado.shape})")
 
         df_consolidado = df_consolidado.reset_index(drop=True)
 
@@ -3533,27 +4848,8 @@ def api_daily_metrics():
         # Usar FunCalculos.py para garantir consistência
         from FunCalculos import processar_backtest_completo
         
-        # CORREÇÃO: Suporte para taxas customizadas de corretagem e emolumentos
-        taxa_corretagem = request.form.get('taxa_corretagem') or request.form.get('backtest_commission')
-        taxa_emolumentos = request.form.get('taxa_emolumentos') or request.form.get('backtest_fees')
-        
-        if taxa_corretagem:
-            try:
-                taxa_corretagem = float(taxa_corretagem)
-                print(f"💼 api_daily_metrics: Taxa de corretagem customizada: R$ {taxa_corretagem:.2f} por roda")
-            except:
-                taxa_corretagem = None
-        else:
-            taxa_corretagem = None
-        
-        if taxa_emolumentos:
-            try:
-                taxa_emolumentos = float(taxa_emolumentos)
-                print(f"💼 api_daily_metrics: Taxa de emolumentos customizada: R$ {taxa_emolumentos:.2f} por roda")
-            except:
-                taxa_emolumentos = None
-        else:
-            taxa_emolumentos = None
+        # CORREÇÃO: Extrair taxas usando função auxiliar
+        taxa_corretagem, taxa_emolumentos = _extrair_taxas_do_request(request)
         
         # Processar backtest completo usando FunCalculos.py
         resultado = processar_backtest_completo(
@@ -3567,18 +4863,34 @@ def api_daily_metrics():
         # Extrair apenas as métricas principais do resultado
         performance_metrics = resultado.get("Performance Metrics", {})
         
-        # Extrair custos operacionais
+        # CORREÇÃO: Extrair custos operacionais corretamente
         operational_costs = resultado.get("Operational Costs", {})
-        corretagem_total = operational_costs.get("corretagem", 0.0) if operational_costs else 0.0
-        emolumentos_total = operational_costs.get("emolumentos", 0.0) if operational_costs else 0.0
+        
+        # Garantir que temos um dict válido
+        if not isinstance(operational_costs, dict):
+            operational_costs = {}
+        
+        # Extrair corretagem e emolumentos separadamente
+        corretagem_total = float(operational_costs.get("corretagem", 0.0))
+        emolumentos_total = float(operational_costs.get("emolumentos", 0.0))
         
         # Se não encontrou nos custos operacionais, buscar nas métricas de performance
         if corretagem_total == 0.0:
-            corretagem_total = performance_metrics.get("Total Brokerage", performance_metrics.get("Corretagem Total", 0.0))
+            corretagem_total = float(performance_metrics.get("Total Brokerage", performance_metrics.get("Corretagem Total", 0.0)))
         if emolumentos_total == 0.0:
-            emolumentos_total = performance_metrics.get("Total Fees", performance_metrics.get("Emolumentos Totais", 0.0))
+            emolumentos_total = float(performance_metrics.get("Total Fees", performance_metrics.get("Emolumentos Totais", 0.0)))
         
-        print(f"🔍 api_daily_metrics: Corretagem: R$ {corretagem_total:.2f}, Emolumentos: R$ {emolumentos_total:.2f}")
+        # Garantir que os valores são números válidos
+        if not isinstance(corretagem_total, (int, float)) or pd.isna(corretagem_total):
+            corretagem_total = 0.0
+        if not isinstance(emolumentos_total, (int, float)) or pd.isna(emolumentos_total):
+            emolumentos_total = 0.0
+        
+        print(f"🔍 api_daily_metrics: Custos operacionais extraídos:")
+        print(f"   📊 Operational Costs keys: {list(operational_costs.keys())}")
+        print(f"   💼 Corretagem: R$ {corretagem_total:.2f}")
+        print(f"   💼 Emolumentos: R$ {emolumentos_total:.2f}")
+        print(f"   💼 Total: R$ {corretagem_total + emolumentos_total:.2f}")
         
         # Converter para formato esperado pelo frontend
         metricas_principais = {
@@ -3592,8 +4904,9 @@ def api_daily_metrics():
             "fator_lucro": performance_metrics.get("Profit Factor", 0),
             "win_rate": performance_metrics.get("Win Rate (%)", 0),
             "roi": (performance_metrics.get("Net Profit", 0) / capital_inicial * 100) if capital_inicial > 0 else 0,
-            "corretagem_total": corretagem_total,
-            "emolumentos_total": emolumentos_total,
+            "corretagem_total": round(corretagem_total, 2),
+            "emolumentos_total": round(emolumentos_total, 2),
+            "custo_total_operacional": round(corretagem_total + emolumentos_total, 2),
             # Campos adicionais para compatibilidade
             "drawdown_maximo_padronizado": -performance_metrics.get("Max Drawdown ($)", 0),
             "drawdown_maximo_pct_padronizado": performance_metrics.get("Max Drawdown (%)", 0),
@@ -3618,6 +4931,14 @@ def api_daily_metrics():
                 "dias_vencedores_perdedores": "N/A",  # Não disponível no FunCalculos.py
                 "dias_perdedores_consecutivos": performance_metrics.get("Max Consecutive Losses", 0),
                 "dias_vencedores_consecutivos": performance_metrics.get("Max Consecutive Wins", 0)
+            },
+            # CORREÇÃO: Adicionar seção de custos operacionais separada
+            "custos_operacionais": {
+                "corretagem": round(corretagem_total, 2),
+                "emolumentos": round(emolumentos_total, 2),
+                "total": round(corretagem_total + emolumentos_total, 2),
+                "taxa_corretagem_aplicada": taxa_corretagem if taxa_corretagem is not None else None,
+                "taxa_emolumentos_aplicada": taxa_emolumentos if taxa_emolumentos is not None else None
             }
         }
         
@@ -4247,6 +5568,303 @@ def calcular_drawdown_padronizado(df: pd.DataFrame) -> Dict[str, float]:
         "capital_inicial": capital_inicial
     }
 
+# ============ ROTAS DE CONFIGURAÇÃO DE COMISSÕES ============
+
+@app.route('/api/user/commission-settings', methods=['GET'])
+@require_auth
+def get_commission_settings():
+    """
+    Buscar as configurações de comissão do usuário logado
+    CORREÇÃO: Separa corretagem e emolumentos
+    Retorna defaults se não existir configuração salva
+    """
+    try:
+        user_id = request.user_id
+        
+        if not supabase_client:
+            print(f"[ERROR] Supabase client não inicializado. SUPABASE_URL: {bool(SUPABASE_URL)}, SUPABASE_KEY: {bool(SUPABASE_KEY)}")
+            return jsonify({
+                "error": "Supabase não configurado. Configure SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente."
+            }), 500
+        
+        print(f"[DEBUG] Buscando configurações para user_id: {user_id}")
+        
+        # Buscar configurações do banco
+        try:
+            # Verificar se a tabela existe tentando fazer uma query simples
+            response = supabase_client.table('user_commission_settings')\
+                .select('*')\
+                .eq('user_id', user_id)\
+                .execute()
+            print(f"[DEBUG] Resposta do Supabase: {len(response.data) if response.data else 0} registros encontrados")
+        except Exception as db_error:
+            error_msg = str(db_error)
+            print(f"[ERROR] Erro ao buscar no Supabase: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            
+            # Se o erro for sobre tabela não encontrada, retornar defaults
+            if 'relation' in error_msg.lower() and 'does not exist' in error_msg.lower():
+                print(f"[WARN] Tabela user_commission_settings não existe. Retornando defaults.")
+                return jsonify({
+                    "corretagem": {
+                        "method": "fixed_per_roda",
+                        "value": 0.50,
+                        "overrideExisting": True
+                    },
+                    "emolumentos": {
+                        "method": "fixed_per_roda",
+                        "value": 0.03,
+                        "overrideExisting": True
+                    },
+                    "applyDifferenceToPnl": True,
+                    "configs": []
+                }), 200
+            
+            return jsonify({
+                "error": f"Erro ao buscar configurações no banco: {error_msg}",
+                "details": error_msg
+            }), 500
+        
+        # Se não encontrou, retornar defaults separados
+        if not response.data or len(response.data) == 0:
+            return jsonify({
+                # Configurações de corretagem
+                "corretagem": {
+                    "method": "fixed_per_roda",  # "fixed_per_roda" ou "fixed_per_trade"
+                    "value": 0.50,  # R$ 0,50 por roda (padrão mercado brasileiro)
+                    "overrideExisting": True
+                },
+                # Configurações de emolumentos
+                "emolumentos": {
+                    "method": "fixed_per_roda",  # "fixed_per_roda" ou "percentage"
+                    "value": 0.03,  # R$ 0,03 por roda (padrão mercado brasileiro)
+                    "overrideExisting": True
+                },
+                "applyDifferenceToPnl": True,
+                "configs": []  # Configurações por ativo
+            }), 200
+        
+        # Retornar configurações encontradas (compatibilidade com formato antigo)
+        data = response.data[0]
+        
+        asset_configs_count = len(data.get('asset_configs', [])) if isinstance(data.get('asset_configs'), list) else 0
+        print(f"[DEBUG] Encontradas {asset_configs_count} configurações de ativo no banco")
+        if asset_configs_count > 0:
+            print(f"[DEBUG] Primeira asset_config do banco: {data.get('asset_configs', [])[0]}")
+            if asset_configs_count > 1:
+                print(f"[DEBUG] Última asset_config do banco: {data.get('asset_configs', [])[-1]}")
+        
+        # Se tem formato antigo, converter para novo formato
+        if 'corretagem' not in data and 'emolumentos' not in data:
+            # Formato antigo - converter
+            return jsonify({
+                "corretagem": {
+                    "method": data.get('corretagem_method', 'fixed_per_roda'),
+                    "value": float(data.get('corretagem_value', 0.50)),
+                    "overrideExisting": data.get('corretagem_override_existing', True)
+                },
+                "emolumentos": {
+                    "method": data.get('emolumentos_method', 'fixed_per_roda'),
+                    "value": float(data.get('emolumentos_value', 0.03)),
+                    "overrideExisting": data.get('emolumentos_override_existing', True)
+                },
+                "applyDifferenceToPnl": data.get('apply_difference_to_pnl', True),
+                "configs": data.get('asset_configs', [])
+            }), 200
+        
+        # Formato novo
+        return jsonify({
+            "corretagem": data.get('corretagem', {
+                "method": "fixed_per_roda",
+                "value": 0.50,
+                "overrideExisting": True
+            }),
+            "emolumentos": data.get('emolumentos', {
+                "method": "fixed_per_roda",
+                "value": 0.03,
+                "overrideExisting": True
+            }),
+            "applyDifferenceToPnl": data.get('apply_difference_to_pnl', True),
+            "configs": data.get('asset_configs', [])
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao buscar configurações de comissão: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": f"Erro ao buscar configurações: {str(e)}",
+            "details": str(e),
+            "type": type(e).__name__
+        }), 500
+
+@app.route('/api/user/commission-settings', methods=['PUT'])
+@require_auth
+def save_commission_settings():
+    """
+    Salvar/atualizar as configurações de comissão do usuário logado
+    CORREÇÃO: Separa corretagem e emolumentos
+    """
+    try:
+        user_id = request.user_id
+        
+        if not supabase_client:
+            return jsonify({
+                "error": "Supabase não configurado. Configure SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente."
+            }), 500
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Body da requisição vazio"}), 400
+        
+        # CORREÇÃO: Extrair configurações separadas de corretagem e emolumentos
+        corretagem_config = data.get('corretagem', {})
+        emolumentos_config = data.get('emolumentos', {})
+        
+        # Compatibilidade com formato antigo
+        if not corretagem_config and not emolumentos_config:
+            # Formato antigo - converter
+            default_method = data.get('defaultMethod', 'fixed')
+            default_value = data.get('defaultValue', 0)
+            corretagem_config = {
+                "method": default_method,
+                "value": default_value,
+                "overrideExisting": data.get('overrideExisting', True)
+            }
+            emolumentos_config = {
+                "method": default_method,
+                "value": default_value,
+                "overrideExisting": data.get('overrideExisting', True)
+            }
+        
+        # Validações para corretagem
+        corretagem_method = corretagem_config.get('method', 'fixed_per_roda')
+        corretagem_value = corretagem_config.get('value', 0.50)
+        if corretagem_method not in ['fixed_per_roda', 'fixed_per_trade']:
+            return jsonify({"error": "corretagem.method deve ser 'fixed_per_roda' ou 'fixed_per_trade'"}), 400
+        if not isinstance(corretagem_value, (int, float)) or corretagem_value < 0:
+            return jsonify({"error": "corretagem.value deve ser um número >= 0"}), 400
+        
+        # Validações para emolumentos
+        emolumentos_method = emolumentos_config.get('method', 'fixed_per_roda')
+        emolumentos_value = emolumentos_config.get('value', 0.03)
+        if emolumentos_method not in ['fixed_per_roda', 'percentage']:
+            return jsonify({"error": "emolumentos.method deve ser 'fixed_per_roda' ou 'percentage'"}), 400
+        if not isinstance(emolumentos_value, (int, float)) or emolumentos_value < 0:
+            return jsonify({"error": "emolumentos.value deve ser um número >= 0"}), 400
+        
+        apply_difference_to_pnl = data.get('applyDifferenceToPnl', True)
+        configs = data.get('configs', [])
+        
+        print(f"[DEBUG] Recebido {len(configs) if isinstance(configs, list) else 0} configurações de ativo")
+        if isinstance(configs, list) and len(configs) > 0:
+            print(f"[DEBUG] Primeira config: {configs[0]}")
+            if len(configs) > 1:
+                print(f"[DEBUG] Última config: {configs[-1]}")
+        
+        if not isinstance(configs, list):
+            return jsonify({"error": "configs deve ser um array"}), 400
+        
+        # Validar cada configuração de ativo
+        for i, config in enumerate(configs):
+            if not isinstance(config, dict):
+                return jsonify({"error": f"configs[{i}] deve ser um objeto"}), 400
+            
+            asset = config.get('asset')
+            if not asset or not isinstance(asset, str) or asset.strip() == '':
+                return jsonify({"error": f"configs[{i}].asset deve ser uma string não vazia"}), 400
+            
+            # Validar corretagem do ativo
+            if 'corretagem' in config:
+                if config['corretagem'].get('method') not in ['fixed_per_roda', 'fixed_per_trade']:
+                    return jsonify({"error": f"configs[{i}].corretagem.method deve ser 'fixed_per_roda' ou 'fixed_per_trade'"}), 400
+                if not isinstance(config['corretagem'].get('value'), (int, float)) or config['corretagem'].get('value') < 0:
+                    return jsonify({"error": f"configs[{i}].corretagem.value deve ser um número >= 0"}), 400
+            
+            # Validar emolumentos do ativo
+            if 'emolumentos' in config:
+                if config['emolumentos'].get('method') not in ['fixed_per_roda', 'percentage']:
+                    return jsonify({"error": f"configs[{i}].emolumentos.method deve ser 'fixed_per_roda' ou 'percentage'"}), 400
+                if not isinstance(config['emolumentos'].get('value'), (int, float)) or config['emolumentos'].get('value') < 0:
+                    return jsonify({"error": f"configs[{i}].emolumentos.value deve ser um número >= 0"}), 400
+        
+        # Preparar dados para salvar
+        asset_configs = []
+        for config in configs:
+            asset_config = {
+                "asset": config['asset'].upper().strip(),
+                "corretagem": config.get('corretagem', corretagem_config),
+                "emolumentos": config.get('emolumentos', emolumentos_config)
+            }
+            asset_configs.append(asset_config)
+        
+        print(f"[DEBUG] Preparando para salvar {len(asset_configs)} configurações de ativo")
+        if len(asset_configs) > 0:
+            print(f"[DEBUG] Primeira asset_config: {asset_configs[0]}")
+            if len(asset_configs) > 1:
+                print(f"[DEBUG] Última asset_config: {asset_configs[-1]}")
+        
+        # Salvar no banco (upsert)
+        upsert_data = {
+            "user_id": user_id,
+            "corretagem": {
+                "method": corretagem_method,
+                "value": float(corretagem_value),
+                "override_existing": bool(corretagem_config.get('overrideExisting', True))
+            },
+            "emolumentos": {
+                "method": emolumentos_method,
+                "value": float(emolumentos_value),
+                "override_existing": bool(emolumentos_config.get('overrideExisting', True))
+            },
+            "apply_difference_to_pnl": bool(apply_difference_to_pnl),
+            "asset_configs": asset_configs
+        }
+        
+        # Tentar salvar usando o cliente Supabase
+        # Se estiver usando SERVICE_ROLE_KEY, bypassa RLS automaticamente
+        try:
+            response = supabase_client.table('user_commission_settings')\
+                .upsert(upsert_data, on_conflict='user_id')\
+                .execute()
+            
+            if not response.data:
+                return jsonify({"error": "Erro ao salvar configurações"}), 500
+        except Exception as db_error:
+            error_str = str(db_error)
+            # Verificar se é erro de RLS
+            if 'row-level security' in error_str.lower() or '42501' in error_str:
+                print(f"[ERROR] Erro de RLS ao salvar configurações: {db_error}")
+                print(f"[ERROR] Isso geralmente acontece quando não está usando SERVICE_ROLE_KEY")
+                return jsonify({
+                    "error": "Erro ao salvar configurações: violação de política de segurança (RLS). Configure SUPABASE_SERVICE_ROLE_KEY no backend para bypassar RLS.",
+                    "details": str(db_error)
+                }), 500
+            # Re-raise outros erros
+            raise
+        
+        # Verificar o que foi salvo
+        saved_data = response.data[0] if response.data else {}
+        saved_asset_configs = saved_data.get('asset_configs', [])
+        print(f"[DEBUG] Dados salvos no banco: {len(saved_asset_configs) if isinstance(saved_asset_configs, list) else 0} configurações")
+        if isinstance(saved_asset_configs, list) and len(saved_asset_configs) > 0:
+            print(f"[DEBUG] Primeira config salva: {saved_asset_configs[0]}")
+            if len(saved_asset_configs) > 1:
+                print(f"[DEBUG] Última config salva: {saved_asset_configs[-1]}")
+        
+        return jsonify({
+            "success": True,
+            "message": "Configurações salvas com sucesso",
+            "settings": upsert_data
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao salvar configurações de comissão: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erro ao salvar configurações: {str(e)}"}), 500
+
 if __name__ == '__main__':
     try:
         app.run(host='0.0.0.0',
@@ -4256,4 +5874,5 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Erro ao iniciar servidor: {e}")
         import traceback
+        traceback.print_exc()
         traceback.print_exc()
